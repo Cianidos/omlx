@@ -16,6 +16,7 @@ def _fresh_nax_state(monkeypatch):
     monkeypatch.setattr(fast, "_nax_available_cache", None)
     monkeypatch.setattr(fast, "_stock_nax_cache", None)
     monkeypatch.setattr(fast, "_qmm_nax_cache", None)
+    monkeypatch.setattr(fast, "_qmm_nax_variant_resolved", None)
     monkeypatch.delenv("OMLX_NAX", raising=False)
     monkeypatch.delenv("OMLX_QWEN35_QMM_NAX", raising=False)
     yield
@@ -101,9 +102,30 @@ def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    monkeypatch.setattr(fast, "_autotune_qmm_nax_variant", lambda: 2)
     kwargs = fast._qmm_nax_kwargs()
-    assert kwargs["use_nax"] is True
-    assert kwargs["nax_variant"] == fast.QMM_NAX_VARIANT
+    assert kwargs == {"use_nax": True, "nax_variant": 2}
+    assert fast.QMM_NAX_VARIANT == 2
+
+
+def test_qmm_nax_autotune_runs_once(monkeypatch):
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    calls = 0
+
+    def autotune():
+        nonlocal calls
+        calls += 1
+        return 3
+
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    monkeypatch.setattr(fast, "_autotune_qmm_nax_variant", autotune)
+    assert fast._qmm_nax_kwargs()["nax_variant"] == 3
+    assert fast._qmm_nax_kwargs()["nax_variant"] == 3
+    assert calls == 1
 
 
 def test_qmm_nax_env_kill_switch(monkeypatch):
