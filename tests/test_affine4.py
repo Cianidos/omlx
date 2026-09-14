@@ -276,6 +276,43 @@ def test_bf16_fused_prefill_matches_reference(
     close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
 
 
+@pytest.mark.parametrize(
+    "dim,repeats,rows,force_fused",
+    [
+        (256, 6, 5, True),
+        (256, 6, 6, None),
+        (64, 8, 5, None),
+        (80, 4, 8, None),
+        (80, 4, 9, True),
+    ],
+)
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_bf16_prefill_forces_only_supported_mlx_fused_shapes(
+    monkeypatch, dim, repeats, rows, force_fused, cache_class
+):
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, 2, 513, dim), mx.bfloat16),
+        random((1, 2, 513, dim), mx.bfloat16, 1),
+    )
+    queries = random((1, 2 * repeats, rows, dim), mx.bfloat16, 2)
+    original = mx.fast.scaled_dot_product_attention
+    calls = []
+
+    def capture(q, k, v, **kwargs):
+        calls.append(
+            (q.dtype, k.dtype, v.dtype, kwargs.get("force_fused"))
+        )
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
+    output = cache.attention(queries, scale=dim**-0.5, mask="causal")
+    assert calls == [
+        (mx.bfloat16, mx.bfloat16, mx.bfloat16, force_fused)
+    ]
+    close(output, dense(cache, queries, "causal"), atol=8e-3, rtol=8e-3)
+
+
 @pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_native_large_values(cache_class):
     if not affine4._m5_mpp_available():
