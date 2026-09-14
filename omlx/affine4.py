@@ -1187,6 +1187,30 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         return mask
 
+    def _mlx_fused_attention_available(
+        self, queries, keys_state, values_state
+    ) -> bool:
+        query_length = queries.shape[-2]
+        query_dim = queries.shape[-1]
+        value_dim = self.value_codec.dim
+        key_length = _state_length(keys_state)
+        kv_heads = keys_state.norms.shape[-2]
+        if (
+            query_dim != self.key_codec.dim
+            or key_length != _state_length(values_state)
+            or query_length > key_length
+            or kv_heads <= 0
+            or queries.shape[-3] % kv_heads
+        ):
+            return False
+        if query_length <= 8:
+            return (
+                query_dim == value_dim
+                and query_dim in (64, 96, 128, 192, 256)
+                and query_length * (queries.shape[-3] // kv_heads) <= 32
+            )
+        return query_dim == value_dim and query_dim in (64, 72, 80, 96, 128, 192, 256)
+
     def _portable_attention(self, queries, keys, values, scale, mask, sinks):
         batch, heads, query_length, _ = queries.shape
         tokens = keys.shape[-2]
@@ -1263,20 +1287,40 @@ class Affine4KVCache(TurboQuantKVCache):
             and queries.dtype == mx.bfloat16
             and queries.shape[-2] > 4
             and _state_length(keys_state) >= _MIN_NATIVE_TOKENS
-            and queries.shape[-2] <= _state_length(keys_state)
             and self.key_codec.dim == self.value_codec.dim
             and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
             and sinks is None
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
-            rotated_output = mx.fast.scaled_dot_product_attention(
-                self.key_codec.prepare_queries(queries).astype(mx.bfloat16),
-                self.key_codec.dequantize_rotated(keys_state, mx.bfloat16),
-                self.value_codec.dequantize_rotated(values_state, mx.bfloat16),
-                scale=scale,
-                mask=effective_mask,
-                force_fused=True,
+            rotated_queries = self.key_codec.prepare_queries(queries).astype(
+                mx.bfloat16
             )
+            rotated_keys = self.key_codec.dequantize_rotated(
+                keys_state, mx.bfloat16
+            )
+            rotated_values = self.value_codec.dequantize_rotated(
+                values_state, mx.bfloat16
+            )
+            if self._mlx_fused_attention_available(
+                queries, keys_state, values_state
+            ):
+                rotated_output = mx.fast.scaled_dot_product_attention(
+                    rotated_queries,
+                    rotated_keys,
+                    rotated_values,
+                    scale=scale,
+                    mask=effective_mask,
+                    force_fused=True,
+                )
+            else:
+                rotated_output = self._portable_attention(
+                    rotated_queries,
+                    rotated_keys,
+                    rotated_values,
+                    scale,
+                    effective_mask,
+                    None,
+                )
             # Retire unpacked KV before the next layer allocates its workspace.
             mx.eval(rotated_output)
             return self.value_codec._rotate_inverse(
