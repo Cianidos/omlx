@@ -144,6 +144,38 @@ def test_singleton_cache_converts_when_another_request_joins(
     assert joined[0].left_padding.shape == (2,)
 
 
+@pytest.mark.parametrize(
+    "scheme,bits,cache_class",
+    [
+        ("affine4", 4, Affine4KVCache),
+        ("affine8", 8, Affine8KVCache),
+    ],
+)
+def test_specprefill_cache_lifecycle_stays_affine(
+    scheduler, scheme, bits, cache_class
+):
+    scheduler._turboquant_kv_scheme = scheme
+    scheduler._turboquant_kv_bits = bits
+    cold = [KVCache(), KVCache()]
+
+    scheduler._prepare_affine_prefill_cache(cold)
+
+    assert [type(cache) for cache in cold] == [cache_class, KVCache]
+    cold[0].update_and_fetch(mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64)))
+    restored = [cache_class.from_state(cold[0].state, cold[0].meta_state), KVCache()]
+
+    scheduler._prepare_affine_prefill_cache(restored)
+
+    assert type(restored[0]) is cache_class
+    assert restored[0].offset == 8
+    restored[0].update_and_fetch(
+        mx.ones((1, 2, 3, 64)), mx.ones((1, 2, 3, 64))
+    )
+    assert restored[0].offset == 11
+    merged = importlib.import_module("mlx_lm.generate")._merge_caches([restored])
+    assert type(merged[0]) is cache_class
+
+
 def test_format_change_requires_engine_reload():
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
