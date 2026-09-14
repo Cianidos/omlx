@@ -180,6 +180,20 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
 
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
+_LEGACY_TURBOQUANT_PROFILE_FIELDS = frozenset(
+    {"turboquant_kv_enabled", "turboquant_kv_bits"}
+)
+
+
+def _profile_settings_with_legacy_kv_scheme(settings: dict) -> dict:
+    """Restore TurboQuant semantics for profiles saved before scheme selection."""
+    if "turboquant_kv_scheme" in settings or not (
+        settings.keys() & _LEGACY_TURBOQUANT_PROFILE_FIELDS
+    ):
+        return settings
+    normalized = dict(settings)
+    normalized["turboquant_kv_scheme"] = "turboquant"
+    return normalized
 
 
 @dataclass
@@ -863,6 +877,17 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings:
+                        normalized = _profile_settings_with_legacy_kv_scheme(settings)
+                        if normalized is not settings:
+                            profile["settings"] = normalized
+                            changed = True
+                            model_changed = True
+                            logger.info(
+                                "Migrated legacy TurboQuant profile '%s' for model '%s'",
+                                name,
+                                model_id,
+                            )
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:
