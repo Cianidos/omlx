@@ -191,7 +191,7 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
-Optional [Affine4 KV compression](docs/affine4.md) adds a four-bit cache format with native M5 attention and a portable fallback. Select it under **Model settings → Advanced settings → KV cache compression**.
+Optional [Affine4](docs/affine4.md) and [Affine8](docs/affine8.md) KV compression add signed 4-bit and 8-bit cache formats with native M5 attention and portable fallbacks. Select either under **Model settings → Advanced settings → KV cache compression**.
 
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
