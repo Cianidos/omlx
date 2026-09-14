@@ -11127,6 +11127,7 @@ class Scheduler:
                         promote_static_prefix_to_hot_cache=(
                             not self._bypass_hot_cache_under_pressure()
                         ),
+                        prepare_prompt_cache=self._prepare_affine_prefill_cache,
                     )
 
                     # An exact static-prefix restore can supersede a shorter

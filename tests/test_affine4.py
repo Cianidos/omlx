@@ -750,6 +750,42 @@ def test_bounded_prefill_preserves_masks_and_sinks(
     assert query_lengths == [3, 3, 1]
 
 
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+@pytest.mark.parametrize("rows", [1, 16])
+def test_portable_attention_peak_is_bounded_across_layers(
+    monkeypatch, cache_class, rows
+):
+    if not mx.metal.is_available():
+        pytest.skip("Peak allocation tracking requires Metal")
+    monkeypatch.setattr(affine4, "_m5_mpp_available", lambda: False)
+    source = cache_class()
+    source.update_and_fetch(
+        random((1, 4, 8192, 128), mx.bfloat16),
+        random((1, 4, 8192, 128), mx.bfloat16, seed=1),
+    )
+    mx.eval(source.state)
+    caches = [cache_class.from_state(source.state, source.meta_state) for _ in range(16)]
+    output = random((1, 16, rows, 128), mx.bfloat16, seed=2)
+    mx.eval(output, *[part for cache in caches for state in cache.state for part in state])
+    mx.synchronize()
+    mx.clear_cache()
+    baseline = mx.get_active_memory()
+    mx.reset_peak_memory()
+    for cache in caches:
+        output = cache.attention(
+            output,
+            scale=128**-0.5,
+            mask="causal" if rows > 1 else None,
+        )
+    mx.eval(output)
+    temporary = mx.get_peak_memory() - baseline
+    assert temporary < 80 * 1024**2, (
+        f"{cache_class.__name__} allocated {temporary / 1024**2:.1f} MiB "
+        f"for {rows}-row attention"
+    )
+    assert mx.all(mx.isfinite(output)).item()
+
+
 def test_bounded_prefill_peak_memory():
     if not mx.metal.is_available():
         pytest.skip("Peak allocation tracking requires Metal")

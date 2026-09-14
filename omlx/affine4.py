@@ -1321,11 +1321,15 @@ class Affine4KVCache(TurboQuantKVCache):
                     effective_mask,
                     None,
                 )
-            # Retire unpacked KV before the next layer allocates its workspace.
-            mx.eval(rotated_output)
-            return self.value_codec._rotate_inverse(
+            output = self.value_codec._rotate_inverse(
                 rotated_output.astype(mx.float32)
             ).astype(queries.dtype)
+            # Copy evaluated output into a graph leaf so later layers do not
+            # retain this layer's unpacked KV workspace.
+            mx.eval(output)
+            output = mx.array(output)
+            mx.eval(output)
+            return output
         rotated_keys = self.key_codec.dequantize_rotated(keys_state)
         rotated_values = self.value_codec.dequantize_rotated(values_state)
         rotated_output = self._portable_attention(
@@ -1336,7 +1340,13 @@ class Affine4KVCache(TurboQuantKVCache):
             mask,
             sinks,
         )
-        return self.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
+        output = self.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
+        # Copy evaluated output into a graph leaf so later layers do not
+        # retain this layer's unpacked KV workspace.
+        mx.eval(output)
+        output = mx.array(output)
+        mx.eval(output)
+        return output
 
     decode_attention = attention
     prefill_attention = attention
