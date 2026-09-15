@@ -127,6 +127,7 @@ class VLMModelAdapter(nn.Module):
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        return_logits: bool = True,
     ):
         return self._language_model.mtp_forward(
             hidden_states,
@@ -134,6 +135,7 @@ class VLMModelAdapter(nn.Module):
             mtp_cache,
             return_hidden=return_hidden,
             logits_keep=logits_keep,
+            return_logits=return_logits,
         )
 
     def make_mtp_cache(self):
