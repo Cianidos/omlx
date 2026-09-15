@@ -143,6 +143,32 @@ def test_processors_see_unmodified_exact_logits(monkeypatch):
     assert mx.isfinite(seen[1]).all().item()
 
 
+def test_stateful_processors_advance_once(monkeypatch):
+    model, head = _quantized_head()
+    _install_coarse(model, head)
+    monkeypatch.setattr(draft_rerank, "_top32", _test_top32)
+
+    class Processor:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _tokens, logits):
+            self.calls += 1
+            return logits
+
+        def snapshot_state(self):
+            return self.calls
+
+        def restore_state(self, state):
+            self.calls = state
+
+    processor = Processor()
+    hidden = mx.random.normal((1, 1, 128), dtype=mx.bfloat16)
+    draft_rerank.select(model, hidden, [processor], mx.array([], dtype=mx.int32))
+
+    assert processor.calls == 1
+
+
 def test_build_gates_dense_and_low_memory_heads(monkeypatch):
     dense = SimpleNamespace(
         args=SimpleNamespace(
