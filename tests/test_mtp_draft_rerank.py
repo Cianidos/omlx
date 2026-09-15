@@ -169,6 +169,27 @@ def test_stateful_processors_advance_once(monkeypatch):
     assert processor.calls == 1
 
 
+def test_build_keeps_sidecar_outside_module_tree(monkeypatch):
+    from mlx.utils import tree_flatten
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            source, _ = _quantized_head()
+            self.args = source.args
+            self.lm_head = source.lm_head
+            self._omlx_mtp_decode_enabled = True
+
+    model = Model()
+    before = {key for key, _ in tree_flatten(model)}
+    monkeypatch.setenv(draft_rerank._RERANK_ENV, "1")
+    monkeypatch.setattr(draft_rerank, "_fits_memory", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(draft_rerank, "_top32", _test_top32)
+
+    assert draft_rerank.build(model) is True
+    assert {key for key, _ in tree_flatten(model)} == before
+
+
 def test_build_gates_dense_and_low_memory_heads(monkeypatch):
     dense = SimpleNamespace(
         args=SimpleNamespace(
