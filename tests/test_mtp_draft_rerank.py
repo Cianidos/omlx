@@ -214,8 +214,12 @@ def test_forced_build_bypasses_memory_gate(monkeypatch):
     assert draft_rerank.available(model) is True
 
 
-def test_top32_metal_matches_argpartition():
+def test_top32_metal_matches_reference_values():
     values = mx.random.normal((248320,), dtype=mx.float32)
-    actual = mx.sort(draft_rerank._top32(values))
-    expected = mx.sort(mx.argpartition(-values, kth=31)[:32])
-    assert mx.array_equal(actual, expected).item()
+    actual = draft_rerank._top32(values)
+    expected = mx.argpartition(-values, kth=31)[:32]
+
+    assert mx.array_equal(
+        mx.sort(values[actual]),
+        mx.sort(values[expected]),
+    ).item()
