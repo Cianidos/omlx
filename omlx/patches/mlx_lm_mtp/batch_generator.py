@@ -2391,12 +2391,21 @@ def _chain_next_drafts(
         begin(state.mtp_cache, depth)
 
     n = committed.shape[0]
+    use_rerank = False
+    if _is_greedy(gen_batch):
+        try:
+            from .draft_rerank import available
+
+            use_rerank = available(model)
+        except Exception:
+            pass
     logits, head_hidden = model.mtp_forward(
         hidden_rows,
         committed.reshape(1, n),
         state.mtp_cache,
         return_hidden=True,
         logits_keep=1,
+        return_logits=not use_rerank,
     )
     state.hist_offset += int(n)
 
@@ -2414,15 +2423,22 @@ def _chain_next_drafts(
     snap = _snap_snapshotable(procs)
 
     for j in range(depth):
-        logits_2d = logits[:, -1, :]
+        prev = None
         if procs is not None and prev_buf is not None:
             prev = mx.concatenate(
                 [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
                 + [t.reshape(1).astype(mx.int32) for t in draft_toks]
             )
+        if use_rerank:
+            from .draft_rerank import select
+
+            tok, lp_1d = select(model, h, procs, prev)
+            lp_2d = lp_1d[None, :]
+        else:
+            logits_2d = logits[:, -1, :]
             logits_2d = _apply_processors(procs, prev, logits_2d)
-        lp_2d = _logprobs(logits_2d)
-        tok = _ensure_uint32(sampler(lp_2d))
+            lp_2d = _logprobs(logits_2d)
+            tok = _ensure_uint32(sampler(lp_2d))
         draft_toks.append(tok)
         draft_lps.append(lp_2d.squeeze(0))
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
@@ -2433,6 +2449,7 @@ def _chain_next_drafts(
             tok.reshape(1, 1),
             chain_cache,
             return_hidden=True,
+            return_logits=not use_rerank,
         )
         h = head_hidden[:, -1:]
 

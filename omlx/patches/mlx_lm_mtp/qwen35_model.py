@@ -531,6 +531,8 @@ def _patch_text_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        return_logits: bool = True,
+        **kwargs,
     ):
         """MTP-head forward.
 
@@ -550,10 +552,12 @@ def _patch_text_model(q35: Any) -> None:
         logits_source = mtp_out
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(logits_source)
-        else:
-            logits = self.lm_head(logits_source)
+        logits = None
+        if return_logits:
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(logits_source)
+            else:
+                logits = self.lm_head(logits_source)
         if return_hidden:
             return logits, mtp_out
         return logits
@@ -784,6 +788,8 @@ def _patch_outer_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        return_logits: bool = True,
+        **kwargs,
     ):
         return self.language_model.mtp_forward(
             hidden_states,
@@ -791,6 +797,7 @@ def _patch_outer_model(q35: Any) -> None:
             mtp_cache,
             return_hidden=return_hidden,
             logits_keep=logits_keep,
+            return_logits=return_logits,
         )
 
     def make_mtp_cache(self):

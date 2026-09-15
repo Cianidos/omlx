@@ -1260,6 +1260,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Currently supports:
     - Bonsai t5: free unused bias tensors (the symmetric t5 kernels never
       read them; the repacked safetensors carries them for format compat)
+    - Native MTP: build the greedy draft coarse lm_head
     - IndexCache: skip redundant indexer computation in DSA layers
 
     Args:
@@ -1283,6 +1284,14 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 
     if model_settings is None:
         return model
+
+    if getattr(model_settings, "mtp_enabled", False):
+        try:
+            from ..patches.mlx_lm_mtp.draft_rerank import build
+
+            build(model)
+        except Exception:
+            logger.warning("MTP draft rerank not built", exc_info=True)
 
     index_cache_freq = getattr(model_settings, "index_cache_freq", None)
     if index_cache_freq is not None and index_cache_freq >= 2:

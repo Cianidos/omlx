@@ -297,6 +297,8 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        return_logits: bool = True,
+        **kwargs,
     ):
         """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
         chain contract: return_hidden yields the head's post-norm hidden for
@@ -310,10 +312,12 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         logits_source = mtp_out
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(logits_source)
-        else:
-            logits = self.lm_head(logits_source)
+        logits = None
+        if return_logits:
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(logits_source)
+            else:
+                logits = self.lm_head(logits_source)
         if return_hidden:
             return logits, mtp_out
         return logits
@@ -370,17 +374,20 @@ def _patch_vlm_model_adapter() -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        return_logits: bool = True,
+        **kwargs,
     ):
         # Forward the depth-k chain kwargs only when set: chain drafting is
         # only enabled on language models whose runtime patch supports them
         # (dense qwen3_5), so a stock/MoE mtp_forward never sees them.
-        if return_hidden or logits_keep:
+        if return_hidden or logits_keep or not return_logits:
             return self._language_model.mtp_forward(
                 hidden_states,
                 next_token_ids,
                 mtp_cache,
                 return_hidden=return_hidden,
                 logits_keep=logits_keep,
+                return_logits=return_logits,
             )
         return self._language_model.mtp_forward(
             hidden_states, next_token_ids, mtp_cache

@@ -1994,6 +1994,16 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
 
+        if getattr(self._model_settings, "mtp_enabled", False):
+            try:
+                from ..patches.mlx_lm_mtp.draft_rerank import build
+
+                await loop.run_in_executor(
+                    get_mlx_executor(), build, self._vlm_model
+                )
+            except Exception:
+                logger.warning("MTP draft rerank not built", exc_info=True)
+
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
         # The repacked safetensors carries 2-bit biases for format compat;
         # the t5 symmetric kernel (scale*(q-1)) never reads them.
