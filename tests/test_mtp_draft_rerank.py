@@ -52,8 +52,7 @@ def test_requantize_rows_matches_one_shot():
         assert mx.array_equal(actual, reference).item()
 
 
-def test_exact_rescore_returns_full_head_argmax_when_shortlisted(monkeypatch):
-    model, head = _quantized_head()
+def _install_coarse(model, head):
     coarse = draft_rerank._requantize_rows(
         head.weight,
         head.scales,
@@ -66,16 +65,23 @@ def test_exact_rescore_returns_full_head_argmax_when_shortlisted(monkeypatch):
     model._omlx_mtp_draft_rerank = coarse
     model._omlx_mtp_draft_rerank_head = head
     model._omlx_mtp_draft_rerank_logged = False
+    return coarse
 
-    def top32(logits):
-        return mx.argpartition(-logits.reshape(-1), kth=31)[:32]
 
-    monkeypatch.setattr(draft_rerank, "_top32", top32)
+def _test_top32(logits):
+    return mx.argpartition(-logits.reshape(-1), kth=31)[:32]
+
+
+def test_exact_rescore_returns_full_head_argmax_when_shortlisted(monkeypatch):
+    model, head = _quantized_head()
+    coarse = _install_coarse(model, head)
+
+    monkeypatch.setattr(draft_rerank, "_top32", _test_top32)
     for _ in range(16):
         hidden = mx.random.normal((1, 1, 128), dtype=mx.bfloat16)
         token, shortlist_lp = draft_rerank.select(model, hidden, None, None)
         full_argmax = int(mx.argmax(head(hidden), axis=-1).item())
-        candidates = top32(
+        candidates = _test_top32(
             mx.quantized_matmul(
                 hidden,
                 *coarse,
@@ -87,6 +93,36 @@ def test_exact_rescore_returns_full_head_argmax_when_shortlisted(monkeypatch):
         assert mx.any(candidates == full_argmax).item()
         assert int(token.item()) == full_argmax
         assert shortlist_lp.shape == (32,)
+
+
+def test_exact_rescore_applies_logits_processors(monkeypatch):
+    from mlx_lm.sample_utils import make_repetition_penalty
+
+    model, head = _quantized_head()
+    coarse = _install_coarse(model, head)
+    monkeypatch.setattr(draft_rerank, "_top32", _test_top32)
+    processor = make_repetition_penalty(1.1, 20)
+    previous = mx.arange(20, dtype=mx.int32)
+
+    for _ in range(16):
+        hidden = mx.random.normal((1, 1, 128), dtype=mx.bfloat16)
+        token, _ = draft_rerank.select(model, hidden, [processor], previous)
+        exact = processor(previous, head(hidden).reshape(1, -1))
+        coarse_logits = processor(
+            previous,
+            mx.quantized_matmul(
+                hidden.reshape(1, -1),
+                *coarse,
+                transpose=True,
+                group_size=64,
+                bits=2,
+            ),
+        )
+        candidates = _test_top32(coarse_logits)
+        full_argmax = int(mx.argmax(exact, axis=-1).item())
+        if mx.any(candidates == full_argmax).item():
+            selected = int(token.item())
+            assert float(exact[0, selected]) == float(exact[0, full_argmax])
 
 
 def test_build_gates_dense_and_low_memory_heads(monkeypatch):
@@ -105,6 +141,13 @@ def test_build_gates_dense_and_low_memory_heads(monkeypatch):
     monkeypatch.setattr(draft_rerank, "_fits_memory", lambda *_args, **_kwargs: False)
     assert draft_rerank.build(quantized) is False
     assert getattr(quantized, "_omlx_mtp_draft_rerank", None) is None
+
+
+def test_build_rejects_non_qwen_model(monkeypatch):
+    model, _head = _quantized_head()
+    model.args.model_type = "deepseek_v4"
+    monkeypatch.setenv(draft_rerank._RERANK_ENV, "1")
+    assert draft_rerank.build(model) is False
 
 
 def test_forced_build_bypasses_memory_gate(monkeypatch):
