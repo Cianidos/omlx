@@ -435,6 +435,7 @@ def select(
     processed_coarse = coarse_logits
     processor_states = []
     if processors:
+        processed_coarse = coarse_logits + 0
         processor_states = [
             (processor, processor.snapshot_state())
             for processor in processors

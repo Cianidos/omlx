@@ -125,6 +125,24 @@ def test_exact_rescore_applies_logits_processors(monkeypatch):
             assert float(exact[0, selected]) == float(exact[0, full_argmax])
 
 
+def test_processors_see_unmodified_exact_logits(monkeypatch):
+    model, head = _quantized_head()
+    _install_coarse(model, head)
+    monkeypatch.setattr(draft_rerank, "_top32", _test_top32)
+    seen = []
+
+    def processor(_tokens, logits):
+        seen.append(logits + 0)
+        logits[:, 0] = -float("inf")
+        return logits
+
+    hidden = mx.random.normal((1, 1, 128), dtype=mx.bfloat16)
+    draft_rerank.select(model, hidden, [processor], mx.array([], dtype=mx.int32))
+
+    assert len(seen) == 2
+    assert mx.isfinite(seen[1]).all().item()
+
+
 def test_build_gates_dense_and_low_memory_heads(monkeypatch):
     dense = SimpleNamespace(
         args=SimpleNamespace(
