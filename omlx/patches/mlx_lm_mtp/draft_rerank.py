@@ -385,6 +385,7 @@ def build(model: Any) -> bool:
             raise ValueError(
                 f"coarse lm_head size mismatch: {resident_bytes} != {coarse_bytes}"
             )
+        mx.eval(_top32(mx.zeros((weight.shape[0],), dtype=mx.float32)))
     except Exception:
         logger.warning(
             "MTP draft rerank build failed; using full lm_head", exc_info=True

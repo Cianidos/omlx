@@ -153,6 +153,11 @@ def test_build_rejects_non_qwen_model(monkeypatch):
 def test_forced_build_bypasses_memory_gate(monkeypatch):
     model, _head = _quantized_head()
     monkeypatch.setenv(draft_rerank._RERANK_ENV, "1")
+    monkeypatch.setattr(
+        draft_rerank,
+        "_top32",
+        lambda logits: mx.argpartition(-logits.reshape(-1), kth=31)[:32],
+    )
     seen = {}
 
     def fits(_bytes, *, forced):
