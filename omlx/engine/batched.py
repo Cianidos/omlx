@@ -376,6 +376,16 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
+        if getattr(self._model_settings, "mtp_enabled", False):
+            try:
+                from ..patches.mlx_lm_mtp.draft_rerank import build
+
+                await loop.run_in_executor(
+                    get_mlx_executor(), build, self._model
+                )
+            except Exception:
+                logger.warning("MTP draft rerank not built", exc_info=True)
+
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
