@@ -117,18 +117,6 @@ def test_kv_compression_scheme_is_saved_and_reset():
     assert "this.modelSettings.turboquant_kv_scheme = 'turboquant';" in script
 
 
-def test_apply_profile_surfaces_server_validation_error():
-    script = _dashboard_script()
-    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
-        "async applyTemplateToForm(template) {", 1
-    )[0]
-
-    assert "this.profileError = '';" in method
-    assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
-    assert "this.profileError = String(e);" in method
-
-
 def test_reasoning_effort_has_presets_and_custom_input():
     """Common strings stay convenient while model-specific values remain usable."""
     html = _model_settings_template()
@@ -446,3 +434,138 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section
+
+
+def test_profile_editor_behavior():
+    """Execute the dashboard methods, including async response and edit races."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+function setup(fetch) {
+    const context = {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {}, navigator: {language: 'en'}, document: {}, fetch,
+    };
+    const state = vm.runInNewContext(source + '\n dashboard;', context)();
+    state.selectedModel = {id: 'model-a'};
+    state.models = [state.selectedModel];
+    state.loadProfilesForModel = async () => {};
+    return state;
+}
+
+test('Template apply uses server identity and effective settings', async () => {
+    const requests = [];
+    const state = setup(async (url, options) => {
+        requests.push([url, options.method]);
+        return {ok: true, json: async () => ({settings: {active_profile_name: 'copy-2', temperature: 0.9}})};
+    });
+    state.profiles = [{name:'coding', settings:{temperature:0.1}}];
+    await state.applyTemplateToForm({name:'coding', settings:{temperature:0.2}});
+    assert.deepEqual(requests, [['/admin/api/models/model-a/profile-templates/coding/apply', 'POST']]);
+    assert.equal(state.activeProfileName, 'copy-2');
+    assert.equal(state.modelSettings.temperature, 0.9);
+});
+
+test('Failed template application keeps the form and surfaces the error', async () => {
+    const state = setup(async () => ({ok:false, status:400, json:async()=>({detail:'Rejected'})}));
+    state.modelSettings.temperature = 0.1;
+    await state.applyTemplateToForm({name:'coding'});
+    assert.equal(state.profileError, 'Rejected');
+    assert.equal(state.modelSettings.temperature, 0.1);
+});
+
+test('Save as new invokes the corresponding apply action', async () => {
+    for (const global of [false, true]) {
+        const state = setup(async (url, options) => ({
+            ok: true, json: async () => ({[global ? 'template' : 'profile']: JSON.parse(options.body)}),
+        }));
+        let applied;
+        state.loadTemplates = async () => {};
+        const apply = global ? 'applyTemplateToForm' : 'applyProfileToForm';
+        state[apply] = async profile => { applied = profile; };
+        if (global) {
+            state.newTemplate = {display_name:'Coding', description:''};
+            await state.createTemplate();
+        } else {
+            state.newProfile = {display_name:'Coding', api_name:'coding', description:''};
+            await state.createProfile();
+        }
+        assert.equal(applied.display_name, 'Coding');
+    }
+});
+
+test('Focus refresh updates clean forms and preserves edits made while fetching', async () => {
+    const state = setup();
+    state.showModelSettingsModal = true;
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    let opened = 0;
+    state.openModelSettings = async()=>{opened++;};
+    state.loadModels = async()=>{};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    state.loadModels = async()=>{state.modelSettings.temperature = 0.3;};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    await state.refreshOpenModelSettings();
+    assert.equal(state.modelSettings.temperature, 0.3);
+    assert.equal(opened, 1);
+});
+
+test('Apply response cannot replace another model editor', async () => {
+    let resolve;
+    const state = setup(() => new Promise(r => {resolve=r;}));
+    const pending = state.applyTemplateToForm({name:'coding'});
+    state.selectedModel = {id:'model-b'};
+    state.modelSettings.temperature = 0.4;
+    resolve({ok:true, json:async()=>({settings:{temperature:0.9}})});
+    await pending;
+    assert.equal(state.modelSettings.temperature, 0.4);
+});
+
+test('Only a current linked copy marks a global template active', () => {
+    const state = setup();
+    state.templates = [{name:'coding',settings:{temperature:0.9}}];
+    const independent = {name:'coding',settings:{temperature:0.1}};
+    const copy = {name:'copy',source_template:'coding',settings:{temperature:0.9}};
+    state.profiles = [independent, copy];
+    state.activeProfileName = 'coding';
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 1);
+    state.activeProfileName = 'copy';
+    assert.equal(state.activeTemplateName, 'coding');
+    copy.settings.temperature = 0.2;
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 2);
+    copy.settings.temperature = 0.9;
+    copy.expose_as_model = true;
+    assert.equal(state.visibleModelProfiles.length, 2);
+    state.templates = [];
+    assert.equal(state.visibleModelProfiles.length, 2);
+});
+
+
+test('Template matching ignores nested dictionary ordering', () => {
+    const state = setup();
+    state.templates = [{name:'coding', settings:{chat_template_kwargs:{enable_thinking:true,custom:1}}}];
+    const copy = {name:'copy', source_template:'coding', settings:{chat_template_kwargs:{custom:1,enable_thinking:true}}};
+    assert.equal(state.matchingProfileTemplate(copy).name, 'coding');
+    copy.settings.chat_template_kwargs.custom = 2;
+    assert.equal(state.matchingProfileTemplate(copy), null);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
