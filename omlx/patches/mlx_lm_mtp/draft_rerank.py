@@ -302,19 +302,11 @@ def _requantize_rows(
     source_mode: str,
     chunk_rows: int = _REQUANTIZE_CHUNK_ROWS,
 ) -> tuple[Any, Any, Any]:
-    rows = int(weight.shape[0])
-    hidden_size = source_group_size * int(scales.shape[1])
-    packed_columns = hidden_size * _COARSE_BITS // 32
-    group_columns = hidden_size // _COARSE_GROUP_SIZE
-    coarse = (
-        mx.zeros((rows, packed_columns), dtype=mx.uint32),
-        mx.zeros((rows, group_columns), dtype=scales.dtype),
-        mx.zeros((rows, group_columns), dtype=biases.dtype),
-    )
-    mx.eval(*coarse)
-
-    for start in range(0, rows, chunk_rows):
-        stop = min(rows, start + chunk_rows)
+    weights = []
+    scale_parts = []
+    bias_parts = []
+    for start in range(0, weight.shape[0], chunk_rows):
+        stop = min(weight.shape[0], start + chunk_rows)
         dense = mx.dequantize(
             weight[start:stop],
             scales[start:stop],
@@ -330,13 +322,15 @@ def _requantize_rows(
             bits=_COARSE_BITS,
             mode="affine",
         )
-        updated = tuple(
-            mx.slice_update(array, part, mx.array([start, 0]), axes=(0, 1))
-            for array, part in zip(coarse, quantized)
-        )
-        mx.eval(*updated)
-        coarse = updated
-    return coarse
+        mx.eval(*quantized)
+        weights.append(quantized[0])
+        scale_parts.append(quantized[1])
+        bias_parts.append(quantized[2])
+    return (
+        mx.concatenate(weights, axis=0),
+        mx.concatenate(scale_parts, axis=0),
+        mx.concatenate(bias_parts, axis=0),
+    )
 
 
 def build(model: Any) -> bool:
