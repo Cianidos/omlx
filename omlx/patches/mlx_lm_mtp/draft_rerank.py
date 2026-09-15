@@ -386,8 +386,8 @@ def build(model: Any) -> bool:
         )
         return False
 
-    inner._omlx_mtp_draft_rerank = coarse
-    inner._omlx_mtp_draft_rerank_head = head
+    object.__setattr__(inner, "_omlx_mtp_draft_rerank", coarse)
+    object.__setattr__(inner, "_omlx_mtp_draft_rerank_head", head)
     inner._omlx_mtp_draft_rerank_logged = False
     logger.info(
         "MTP draft rerank ready: 2-bit/gs64 coarse lm_head %.0f MiB, top-%d exact rescore (%.0f ms)",
