@@ -2399,13 +2399,14 @@ def _chain_next_drafts(
             use_rerank = available(model)
         except Exception:
             pass
+    fold_kwargs = {"return_hidden": True, "logits_keep": 1}
+    if use_rerank:
+        fold_kwargs["return_logits"] = False
     logits, head_hidden = model.mtp_forward(
         hidden_rows,
         committed.reshape(1, n),
         state.mtp_cache,
-        return_hidden=True,
-        logits_keep=1,
-        return_logits=not use_rerank,
+        **fold_kwargs,
     )
     state.hist_offset += int(n)
 
@@ -2444,12 +2445,14 @@ def _chain_next_drafts(
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         if j + 1 == depth:
             break
+        step_kwargs = {"return_hidden": True}
+        if use_rerank:
+            step_kwargs["return_logits"] = False
         logits, head_hidden = model.mtp_forward(
             h,
             tok.reshape(1, 1),
             chain_cache,
-            return_hidden=True,
-            return_logits=not use_rerank,
+            **step_kwargs,
         )
         h = head_hidden[:, -1:]
 
