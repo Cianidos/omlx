@@ -61,6 +61,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
@@ -1231,7 +1232,8 @@ def _prepare_mrope_prompt(self):
 def _patched_ppb_prompt(self, tokens):
     _prepare_mrope_prompt(self)
     # Late-bound so model patches can swap the loop under this wrapper.
-    return PromptProcessingBatch._omlx_base_prompt(self, tokens)
+    with _mtp_priming.prefill_scope(self.model, self.uids, tokens, self.prompt_cache):
+        return PromptProcessingBatch._omlx_base_prompt(self, tokens)
 
 
 PromptProcessingBatch._omlx_base_prompt = _original_ppb_prompt
@@ -3584,6 +3586,7 @@ class Scheduler:
             _PrefillAbortedError: If prefill is interrupted by a pending abort.
             RuntimeError: If memory limit exceeded during prefill.
         """
+        _mtp_priming.activate_request(self.model, request.request_id)
         n_tokens = len(tokens)
         gathered_core = self._qwen4_text_gathered_pricing(vlm_embeds is None)
         if n_tokens <= 1:
@@ -4836,6 +4839,7 @@ class Scheduler:
         self._store_cache_admission_blocked_since = 0.0
 
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
+        _mtp_priming.release_request(getattr(self, "model", None), request_id)
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
@@ -5533,6 +5537,7 @@ class Scheduler:
         Raises:
             RuntimeError: If the hard memory limit is exceeded.
         """
+        _mtp_priming.activate_request(self.model, state.request.request_id)
         if state.tokens_remaining.shape[1] == 0:
             return True
 
@@ -5894,6 +5899,7 @@ class Scheduler:
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
+            _mtp_priming.bind_uid(self.model, request.request_id, uid)
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
             now = time.monotonic()
@@ -6069,8 +6075,7 @@ class Scheduler:
         # Tokenize stop strings into token sequences. mlx-lm's
         # SequenceStateMachine uses Aho-Corasick, so per-token match
         # cost stays O(1) regardless of how many sequences are added.
-        # BPE merge edge cases (where a stop string boundary lands
-        # mid-token) may miss; that is a known limitation.
+        # Text matching below also covers context-dependent BPE boundaries.
         for stop_str in request.sampling_params.stop or []:
             if not isinstance(stop_str, str) or not stop_str:
                 continue
@@ -6098,19 +6103,33 @@ class Scheduler:
         request: "Request",
         response: Any,
         output: RequestOutput,
+        stop_prefix_chars: int | None = None,
     ) -> list[RequestOutput]:
         """Suppress every output chunk belonging to a matched stop sequence.
 
         mlx-lm reports the full ``match_sequence`` but marks only its final
-        token as ``finish_reason=stop``.  Keep only a suffix that is a token
-        prefix of a configured stop string, then discard that suffix when the
-        full sequence matches.  All other output is released immediately.
+        token as ``finish_reason=stop``. Keep token and text prefixes pending
+        until they either match or diverge, including context-dependent BPE
+        tokens that differ from the standalone stop encoding.
         """
         state = getattr(request, "_stop_output_state", None)
         if state is None or not state.strings:
             return [output]
 
         pending = state.pending
+        if stop_prefix_chars is not None:
+            # The text matcher already clipped this chunk and the final text.
+            # Remove only the matched characters from earlier pending chunks.
+            prefix = "".join(chunk.new_text for _, chunk in pending)
+            if stop_prefix_chars:
+                prefix = prefix[:-stop_prefix_chars]
+            output.new_text = prefix + output.new_text
+            output.new_token_ids = []
+            if prefix and pending:
+                output.generated_at = pending[0][1].generated_at
+            pending.clear()
+            return [output]
+
         pending.append((int(response.token), output))
 
         pending_tokens = tuple(token for token, _ in pending)
@@ -6185,6 +6204,21 @@ class Scheduler:
             for prefix_len in range(max_prefix, keep, -1):
                 if pending_tokens[-prefix_len:] == sequence[:prefix_len]:
                     keep = prefix_len
+                    break
+
+        pending_text = "".join(chunk.new_text for _, chunk in pending)
+        keep_chars = 0
+        for stop_string in state.strings.values():
+            for size in range(min(len(stop_string), len(pending_text)), keep_chars, -1):
+                if pending_text.endswith(stop_string[:size]):
+                    keep_chars = size
+                    break
+        if keep_chars:
+            suffix_chars = 0
+            for count, (_, chunk) in enumerate(reversed(pending), 1):
+                suffix_chars += len(chunk.new_text)
+                if suffix_chars >= keep_chars:
+                    keep = max(keep, count)
                     break
 
         ready = []
@@ -11382,6 +11416,7 @@ class Scheduler:
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
+                _mtp_priming.bind_uid(self.model, request.request_id, uid)
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 now = time.monotonic()
@@ -11434,6 +11469,9 @@ class Scheduler:
             if request_id is None:
                 continue
 
+            if request_id in finished_ids:
+                continue
+
             request = self.running.get(request_id)
             if request is None:
                 continue
@@ -11467,6 +11505,7 @@ class Scheduler:
 
             # Only append token if not stopping due to EOS token
             new_text = ""
+            stop_prefix_chars = None
 
             # Check if this request uses a protocol-specific output parser
             parser_session = self._get_output_parser_session(request_id)
@@ -11504,29 +11543,36 @@ class Scheduler:
                     # Fallback to single-token decode
                     new_text = self.tokenizer.decode([response.token])
 
-                # Text-level stop-string fallback. Catches BPE edge cases
-                # where the tokenized stop sequence does not match the
-                # model's actual output tokens (e.g. " delta" vs "delta").
-                # Only scans the tail to keep cost O(stop_len) per step.
-                stop_strs = request.sampling_params.stop or []
-                if stop_strs and not is_finished and detokenizer is not None:
-                    full_text = detokenizer.text
-                    prev_len = len(full_text) - len(new_text)
-                    for ss in stop_strs:
-                        if not ss:
-                            continue
-                        scan_start = max(0, prev_len - len(ss) + 1)
-                        idx_in_tail = full_text.find(ss, scan_start)
-                        if idx_in_tail < 0:
-                            continue
-                        is_finished = True
-                        is_stop = True
-                        response.finish_reason = "stop"
-                        if idx_in_tail >= prev_len:
-                            new_text = new_text[: idx_in_tail - prev_len]
-                        else:
-                            new_text = ""
-                        break
+            # Match the emitted text for parser and ordinary decode paths.
+            # Pending chunks retain prefixes even when contextual BPE tokens
+            # differ from the standalone stop encoding.
+            stop_strs = request.sampling_params.stop or []
+            if stop_strs and (not is_stop or new_text):
+                if parser_session is not None:
+                    state = getattr(request, "_stop_output_state", None)
+                    pending_text = (
+                        "".join(chunk.new_text for _, chunk in state.pending)
+                        if state is not None
+                        else ""
+                    )
+                    full_text = pending_text + new_text
+                else:
+                    full_text = (
+                        detokenizer.text if detokenizer is not None else new_text
+                    )
+                prev_len = len(full_text) - len(new_text)
+                matches = [
+                    full_text.find(ss, max(0, prev_len - len(ss) + 1))
+                    for ss in stop_strs
+                    if ss
+                ]
+                match = min((pos for pos in matches if pos >= 0), default=None)
+                if match is not None:
+                    is_finished = True
+                    is_stop = True
+                    response.finish_reason = "stop"
+                    stop_prefix_chars = max(0, prev_len - match)
+                    new_text = new_text[: max(0, match - prev_len)]
 
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
@@ -11605,6 +11651,11 @@ class Scheduler:
 
                 if parser_session is not None:
                     final_result = parser_session.finalize()
+                    if stop_prefix_chars is not None:
+                        final_result.stream_text = ""
+                        final_result.visible_text = ""
+                        final_result.tool_calls = []
+                        final_result.finish_reason = None
                     if final_result.stream_text:
                         output.new_text += final_result.stream_text
                     if final_result.visible_text:
@@ -11625,26 +11676,47 @@ class Scheduler:
                     if detokenizer is not None:
                         detokenizer.finalize()
                         final_segment = detokenizer.last_segment
-                        if final_segment:
+                        if final_segment and stop_prefix_chars is None:
                             output.new_text += final_segment
 
                     # Decode full output
                     output.output_text = self.tokenizer.decode(request.output_token_ids)
                     request.output_text = output.output_text
 
-                    # Trim accumulated output text at the first stop string
-                    # match so non-streaming responses do not include the
-                    # stop sequence itself (matches OpenAI semantics).
-                    if is_stop:
-                        stop_strs = request.sampling_params.stop or []
-                        for ss in stop_strs:
-                            if not ss:
-                                continue
-                            cut = output.output_text.find(ss)
-                            if cut >= 0:
-                                output.output_text = output.output_text[:cut]
-                                request.output_text = output.output_text
-                                break
+                # Finalization may release a parser marker or incomplete UTF-8
+                # text. Apply the same stop boundary before flushing that text.
+                if stop_strs and stop_prefix_chars is None:
+                    state = getattr(request, "_stop_output_state", None)
+                    pending_text = (
+                        "".join(chunk.new_text for _, chunk in state.pending)
+                        if state is not None
+                        else ""
+                    )
+                    final_text = pending_text + output.new_text
+                    matches = [final_text.find(ss) for ss in stop_strs if ss]
+                    cut = min((pos for pos in matches if pos >= 0), default=None)
+                    if cut is not None:
+                        is_stop = True
+                        request.set_finished(RequestStatus.FINISHED_STOPPED)
+                        response.finish_reason = output.finish_reason = "stop"
+                        stop_prefix_chars = max(0, len(pending_text) - cut)
+                        output.new_text = output.new_text[
+                            : max(0, cut - len(pending_text))
+                        ]
+                        output.new_token_ids = []
+                        output.tool_calls = []
+
+                # Both parser and ordinary text omit the first matched stop.
+                if is_stop:
+                    matches = [
+                        output.output_text.find(ss)
+                        for ss in request.sampling_params.stop or []
+                        if ss
+                    ]
+                    cut = min((pos for pos in matches if pos >= 0), default=None)
+                    if cut is not None:
+                        output.output_text = output.output_text[:cut]
+                        request.output_text = output.output_text
 
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
@@ -11696,7 +11768,11 @@ class Scheduler:
                     5, "Request %s generated text:\n%s", request_id, output.output_text
                 )
 
-            outputs.extend(self._buffer_stop_sequence_output(request, response, output))
+            outputs.extend(
+                self._buffer_stop_sequence_output(
+                    request, response, output, stop_prefix_chars
+                )
+            )
 
         return outputs, finished_ids
 
@@ -11758,6 +11834,7 @@ class Scheduler:
             self._throttle_notified_requests.discard(rid)
 
         for request_id in finished_ids:
+            _mtp_priming.release_request(self.model, request_id)
             request = self.running.get(request_id)
 
             # Store cache for future reuse (G2-async): submit to background
@@ -12917,6 +12994,7 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
+        _mtp_priming.clear_owned(getattr(self, "model", None))
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)
         self._decode_time_owed_s = 0.0
@@ -13060,6 +13138,7 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         teardown = getattr(self, "_engine_teardown", None)
+        _mtp_priming.clear_owned(getattr(self, "model", None))
         logger.info("Scheduler shutdown initiated...")
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)

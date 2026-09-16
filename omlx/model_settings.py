@@ -455,10 +455,10 @@ class ModelSettings:
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
-    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
-    # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
-    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash.
+    # Lightning MTP uses the embedded head for single and concurrent requests.
+    # Equal-depth rows share target verification when supported by the backbone;
+    # each request keeps its own acceptance, draft history and cache frontier.
+    # Mutually exclusive with DFlash.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
     # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).

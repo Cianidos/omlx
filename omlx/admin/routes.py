@@ -30,7 +30,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -451,6 +451,58 @@ class UpdateTemplateRequest(BaseModel):
         return _normalize_profile_settings(value, universal=True)
 
 
+# Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
+DASHBOARD_COLUMNS = 24
+DASHBOARD_BLOCK_MIN_W = 6
+DASHBOARD_BLOCK_IDS = (
+    "serving_stats",
+    "usage_history",
+    "active_models",
+    "cache_observability",
+    "api_endpoints",
+    "claude_code",
+    "applications",
+    "engine_versions",
+)
+
+
+class DashboardLayoutBlock(BaseModel):
+    """One placed dashboard block in grid units."""
+
+    id: str
+    x: int = Field(ge=0, lt=DASHBOARD_COLUMNS)
+    y: int = Field(ge=0)
+    w: int = Field(ge=DASHBOARD_BLOCK_MIN_W, le=DASHBOARD_COLUMNS)
+
+    @model_validator(mode="after")
+    def _fits_grid(self):
+        if self.x + self.w > DASHBOARD_COLUMNS:
+            raise ValueError(f"block {self.id!r} exceeds {DASHBOARD_COLUMNS} columns")
+        return self
+
+
+class DashboardLayoutRequest(BaseModel):
+    """Saved dashboard block layout."""
+
+    version: Literal[1] = 1
+    width: Literal["default", "wide", "wider", "full"] = "default"
+    blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def _known_unique_blocks(cls, blocks):
+        # Unknown ids are dropped for forward compatibility; duplicates keep
+        # the first occurrence.
+        seen: set[str] = set()
+        kept = []
+        for block in blocks:
+            if block.id not in DASHBOARD_BLOCK_IDS or block.id in seen:
+                continue
+            seen.add(block.id)
+            kept.append(block)
+        return kept
+
+
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
@@ -563,6 +615,8 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: str | None = None
+    # Explicit null restores the default dashboard layout.
+    ui_dashboard_layout: DashboardLayoutRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -4200,6 +4254,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "ui": {
             "language": global_settings.ui.language,
+            "dashboard_layout": global_settings.ui.dashboard_layout,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -5115,6 +5170,13 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    if "ui_dashboard_layout" in request.model_fields_set:
+        layout = request.ui_dashboard_layout
+        global_settings.ui.dashboard_layout = (
+            layout.model_dump() if layout is not None else None
+        )
+        runtime_applied.append("ui_dashboard_layout")
 
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)

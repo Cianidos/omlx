@@ -20,9 +20,6 @@ import pytest
 
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
-    _SDPA_FULL_SUPPORTED_HEAD_DIMS,
-    _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
-    _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
     collect_kv_layer_specs,
     estimate_mla_kv_bytes_per_token,
@@ -578,11 +575,6 @@ class TestSetModelInfoTurboQuantDtype:
 
 class TestSdpaDispatchEstimate:
     """MemoryMonitor mirrors MLX SDPA full/vector dispatch support."""
-
-    def test_sdpa_dispatch_constants_match_mlx_0322(self):
-        assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
-        assert frozenset({64, 72, 80, 96, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
-        assert frozenset({64, 96, 128, 256}) == (_SDPA_VECTOR_SUPPORTED_HEAD_DIMS)
 
     def test_estimate_prefill_uses_full_fallback_for_head_dim_256(self):
         """head_dim=256 is not supported by MLX fused full prefill."""

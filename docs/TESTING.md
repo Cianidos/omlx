@@ -12,7 +12,7 @@ Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding
 
 # QSA reservation tests
 
-Run `python -m pytest -q tests/test_qwen4_qsa_reservation_integration.py tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.
+Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.
 
 The integration tests cover restored-prefix lengths with boundary snapshots enabled and disabled, the first allocation after cache restoration, and prefill/decode output equivalence using a small Qwen4 model.
 
@@ -102,3 +102,9 @@ Run `python -m pytest tests/test_model_settings_profiles.py tests/test_admin_pro
 Global and model profiles may share display names while retaining separate IDs. Applying a global template reads its latest settings; deleting it preserves model copies as independent profiles. Both editors save and apply new profiles, and focus refresh preserves unsaved edits.
 
 Startup reference repair is covered in `tests/test_model_settings_profiles.py`: missing references are cleared without replacing saved values, originals are backed up under `<base_path>/profile-reference-backup-*`, and subsequent loads do not write again. Retries with unchanged originals reuse the same content-hash backup directory and fill missing files. Mismatched backups prevent repair. Invalid storage, unsupported versions, backup failures, and failed writes must not persist inferred repairs. A rollback failure aborts startup and logs the backup path.
+
+## Qwen tool-call recovery
+
+Run `python -m pytest tests/test_tool_calling.py tests/integration/test_e2e_streaming.py -q`. Final Qwen parsing preserves unknown tool names for client feedback, recovers complete functions missing only the outer envelope close at normal EOF, and reports unrecoverable siblings without a successful stop. Cases cover all three streaming APIs, chunk boundaries, repeated calls, literal tags in arguments, schema validation and length stops. Other parser families and reasoning-channel promotion keep their existing rules.
+
+For a real-server check, request a small `write(content: string)` call with thinking disabled and greedy sampling. Compare the normal result with a request using `stop: ["</tool_call>"]`: the complete function should still arrive once with identical arguments. Then supply an assistant call to an unknown tool followed by a matching tool-error message naming `write`; verify the next model turn uses `write`. Use an isolated port and base path, and do not execute model-supplied file operations during the check.
