@@ -1097,6 +1097,15 @@ def _initial_batch_forward(gen_batch):
     """Advance fresh Qwen rows together without extracting target caches."""
     from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
+    cache_types = (ArraysCache, BatchKVCache)
+    try:
+        from mlx_vlm.models.cache import ArraysCache as VLMArray
+        from mlx_vlm.models.cache import BatchKVCache as VLMKV
+    except ImportError:
+        pass
+    else:
+        cache_types += (VLMArray, VLMKV)
+
     host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
     if not (
@@ -1105,7 +1114,7 @@ def _initial_batch_forward(gen_batch):
         and not head_clone
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
-        and all(type(c) in (ArraysCache, BatchKVCache) for c in gen_batch.prompt_cache)
+        and all(type(c) in cache_types for c in gen_batch.prompt_cache)
         and all(
             _is_greedy(
                 _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
@@ -1611,7 +1620,21 @@ def _call_backbone(
         hidden = result.hidden_states
         if isinstance(hidden, list):
             hidden = hidden[-1] if hidden else None
-        return result.logits, hidden, getattr(result, "gdn_states", None)
+        rollback_state = getattr(result, "gdn_states", None)
+        try:
+            from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+        except ImportError:
+            SpeculativeCacheTransaction = ()
+
+        if not n_confirmed and isinstance(rollback_state, SpeculativeCacheTransaction):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                [inputs.shape[1] - 1] * inputs.shape[0],
+                inputs.shape[1],
+            )
+            rollback_state = None
+        return result.logits, hidden, rollback_state
     if isinstance(result, tuple):
         if len(result) == 3:
             return result
@@ -2526,7 +2549,11 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         verify_result = _call_backbone(
             gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
         )
-    logits, hidden, _ = verify_result
+    logits, hidden, rollback_state = verify_result
+    if rollback_state is not None:
+        gen_batch.model.rollback_speculative_cache(
+            gen_batch.prompt_cache, rollback_state, 0, 1
+        )
     _clear_rollback(gen_batch.prompt_cache)
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
@@ -3316,7 +3343,7 @@ def _run_verify_cycle_chain(
         )
         if commit_cache is not None:
             gen_batch.prompt_cache = commit_cache(m)
-        elif m == k:
+        elif m == k and gdn_states is None:
             _clear_rollback(gen_batch.prompt_cache)
         elif not _chain_rollback(
             gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
@@ -3576,6 +3603,10 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
         state.stats.accepts += 1
         # --- cache cleanup (timed) ---
         t0 = time.perf_counter()
+        if gdn_states is not None:
+            gen_batch.model.rollback_speculative_cache(
+                gen_batch.prompt_cache, gdn_states, 1, 2
+            )
         _clear_rollback(gen_batch.prompt_cache)
         state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 

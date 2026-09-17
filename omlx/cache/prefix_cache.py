@@ -965,6 +965,27 @@ class BlockAwarePrefixCache(CacheManager):
         require_contiguous_pooling_snapshots = bool(
             boundary_snapshots
         ) and _contains_pooling_cache_state(cache_data)
+        snapshot_base_tokens = 0
+        if boundary_snapshots and not pm_layers_present:
+            first_boundary = min(boundary_snapshots.keys())
+            first_snapshot = (
+                boundary_snapshots[first_boundary]
+                if first_boundary > self.block_size else None
+            )
+            if first_snapshot and len(first_snapshot) == len(cache_data):
+                complete = all(
+                    not CacheTypeRegistry.get_handler_by_class_name(
+                        layer.get("class_name", "KVCache")
+                    ).supports_block_slicing
+                    for layer in first_snapshot
+                )
+                for layer in first_snapshot:
+                    for span in layer.get("pooling_delta_ranges", {}).values():
+                        complete = complete and span[0] == 0
+                if complete:
+                    # A full snapshot can follow an indivisible image prefix.
+                    snapshot_base_tokens = first_boundary
+
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
@@ -1003,6 +1024,7 @@ class BlockAwarePrefixCache(CacheManager):
             # intermediate snapshot.
             if (
                 require_contiguous_pooling_snapshots
+                and global_end >= snapshot_base_tokens
                 and not is_last_block
                 and not has_boundary_snapshot
             ):
@@ -1227,6 +1249,7 @@ class BlockAwarePrefixCache(CacheManager):
                 #      longer needs cache_data's live seq_len for them.
                 if (
                     snapshot_cache_data is None
+                    and global_end >= snapshot_base_tokens
                     and not is_last_block
                     and cache_seq_len > 0
                     and cache_start >= cache_seq_len

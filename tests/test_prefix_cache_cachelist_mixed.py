@@ -420,26 +420,40 @@ def test_boundary_store_mixed_cachelist_roundtrip(tmp_path):
     store.shutdown()
 
 
-def test_arrays_cache_extract_none_guard():
-    """Extract from an ArraysCache with untouched (None) slots — the state
-    of a request aborted before its first forward — must not crash.
-    filter/extend/merge already tolerate None slots; extract lacked the
-    guard until the omlx patch."""
+@pytest.mark.parametrize("cache_module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"])
+def test_arrays_cache_extract_none_guard(cache_module):
+    """Extract a batch row while preserving untouched recurrent slots."""
+    from importlib import import_module
+
     from omlx.patches.arrays_cache_extract import (
         apply_arrays_cache_extract_guard,
     )
 
+    caches = import_module(cache_module)
     assert apply_arrays_cache_extract_guard() is True
+    extract = caches.ArraysCache.extract
+    assert apply_arrays_cache_extract_guard() is True
+    assert caches.ArraysCache.extract is extract
 
-    ac = ArraysCache(size=4)
-    ac[0] = mx.ones((2, 3, 8))
+    ac = caches.ArraysCache(size=4)
+    ac[0] = mx.arange(48).reshape(2, 3, 8)
     out = ac.extract(1)
+    assert type(out) is caches.ArraysCache
     assert out.cache[0].shape == (1, 3, 8)
+    assert mx.array_equal(out[0], ac[0][1:2]).item()
     assert out.cache[1] is None
     assert out.cache[2] is None
+    assert out.cache[3] is None
 
-    all_none = ArraysCache(size=4).extract(0)
+    all_none = caches.ArraysCache(size=4).extract(0)
     assert all(slot is None for slot in all_none.cache)
+
+    nested = caches.CacheList(caches.CacheList(ac, caches.ArraysCache(4)))
+    row = nested.extract(1)
+    assert type(row) is caches.CacheList
+    assert type(row[0][0]) is caches.ArraysCache
+    assert mx.array_equal(row[0][0][0], ac[0][1:2]).item()
+    assert all(slot is None for slot in row[0][1].cache)
 
 
 def test_none_conv_slots_roundtrip(tmp_path):

@@ -357,29 +357,12 @@ def test_model_settings_vlm_mtp_mutex(vlm_mtp_kw, other_kw):
 
 
 # ---------------------------------------------------------------------------
-# MoE config patch tests
+# Upstream drafter config contracts
 # ---------------------------------------------------------------------------
 
 
-class TestMoeConfigPatch:
-    """Verify that the MoE compat patch in vlm_mtp.py correctly handles
-    qwen3_5_moe_text text_config dicts."""
-
-    def test_patch_is_applied_on_import(self):
-        """The patch runs at import time; Qwen3_5MTPConfig.__post_init__
-        should be the patched version."""
-        try:
-            from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
-                Qwen3_5MTPConfig,
-            )
-        except ImportError:
-            pytest.skip("mlx-vlm qwen3_5_mtp drafter not available")
-
-        # The patched __post_init__ is a closure, not the original method.
-        # Verify it was replaced by checking it's not the unpatched version.
-        src = Qwen3_5MTPConfig.__post_init__
-        # The patched version references MoETextConfig in its closure.
-        assert src is not None
+class TestMoeDrafterConfig:
+    """The pinned upstream drafter must retain dense and MoE dispatch."""
 
     def test_moe_text_config_accepted(self):
         """Qwen3_5MTPConfig.from_dict with a MoE text_config does not raise."""
@@ -398,6 +381,7 @@ class TestMoeConfigPatch:
                 "num_hidden_layers": 2,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
+                "head_dim": 16,
                 "num_experts": 8,
                 "num_experts_per_tok": 2,
                 "shared_expert_intermediate_size": 128,
@@ -417,6 +401,14 @@ class TestMoeConfigPatch:
         assert cfg.text_config is not None
         assert cfg.text_config.hidden_size == 64
         assert cfg.text_config.num_experts == 8
+
+        from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
+            Qwen3_5MTPDraftModel,
+        )
+
+        draft = Qwen3_5MTPDraftModel(cfg)
+        assert isinstance(draft.layers[0], Qwen3_5MoeDecoderLayer)
 
     def test_dense_text_config_still_works(self):
         """Qwen3_5MTPConfig.from_dict with a dense text_config still works."""
