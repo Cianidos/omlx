@@ -233,6 +233,13 @@ class ByteFallbackTokenizer:
         "<0xA0>": 3,
     }
 
+    def __len__(self):
+        return len(self.vocab)
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {value: key for key, value in self.vocab.items()}
+        return [reverse[token_id] for token_id in ids]
+
     def decode(self, token_ids, skip_special_tokens: bool = True):
         table = {
             0: b"",

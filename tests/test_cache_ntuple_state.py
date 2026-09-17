@@ -115,12 +115,15 @@ class TestDeserializeStateLegacyContract:
         )
         h = KVCacheHandler()
         elements = h.serialize_state(original)
-        restored = h.deserialize_state(elements, meta_state=original.meta_state)
+        restored = h.deserialize_state(
+            elements, meta_state=h.serialize_meta_state(original)
+        )
         assert restored is not None
-        # Compare trimmed state tuples (KVCache.state returns sliced view
-        # without internal padding chunks).
-        orig_keys, orig_values = original.state
-        rest_keys, rest_values = restored.state
+        assert original.keys.shape[2] > original.offset
+        assert len(elements) == 2
+        assert elements[0].shape[2] == original.offset == restored.offset
+        orig_keys, orig_values = original.keys_and_values()
+        rest_keys, rest_values = restored.keys_and_values()
         assert orig_keys.shape == rest_keys.shape
         assert mx.max(mx.abs(rest_keys - orig_keys)).item() == 0.0
         assert mx.max(mx.abs(rest_values - orig_values)).item() == 0.0
@@ -565,7 +568,9 @@ class TestPrefixCacheNTupleSubState:
         h = PoolingCacheHandler()
         elements = h.serialize_state(original)
         assert len(elements) == 5
-        restored = h.deserialize_state(elements, meta_state=ratio)
+        restored = h.deserialize_state(
+            elements, meta_state=h.serialize_meta_state(original)
+        )
         assert restored is not None
         assert restored.ratio == ratio
         rest_kv, rest_gate, rest_pool, rest_prev_kv, rest_prev_gate = restored.state
@@ -672,3 +677,25 @@ class TestPrefixCacheNTupleSubState:
             assert isinstance(sub, tuple)
             assert len(sub) == 2
             assert mx.max(mx.abs(sub[0] - keys)).item() == 0.0
+
+
+def test_chunked_cache_round_trip_preserves_trimmed_absolute_positions():
+    import mlx.core as mx
+    from mlx_lm.models.cache import ChunkedKVCache
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    original = ChunkedKVCache(chunk_size=4)
+    values = mx.arange(48).reshape(1, 1, 12, 4).astype(mx.float32)
+    original.update_and_fetch(values, values)
+    original.maybe_trim_front()
+    handler = CacheTypeRegistry.get_handler_for_object(original)
+    assert not handler.supports_block_slicing
+    restored = handler.deserialize_state(
+        handler.serialize_state(original), handler.serialize_meta_state(original)
+    )
+    assert (restored.offset, restored.start_position, restored.chunk_size) == (12, 8, 4)
+    for entry in (original, restored):
+        entry.update_and_fetch(values[:, :, :1], values[:, :, :1])
+        entry.maybe_trim_front()
+    assert mx.array_equal(original.keys_and_values()[0], restored.keys_and_values()[0])
+    assert original.offset == restored.offset == 13

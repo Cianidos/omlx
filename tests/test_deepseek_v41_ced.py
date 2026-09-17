@@ -53,7 +53,7 @@ def test_short_suffix_preserves_positions_and_window(suffix, monkeypatch):
     for a, b in zip(cache, baseline):
         assert a.size() == b.size() == 6 + suffix
         assert a[1].shape[1] == 4
-        for x, y in zip(a.state, b.state):
+        for x, y in zip(a.cache, b.cache):
             np.testing.assert_array_equal(x, y)
 
 
@@ -97,7 +97,7 @@ def test_dspark_ring_and_rollback_after_ced_prefill():
     assert model.mtp_partial_rollback(cache, 1, 2)
     model(ids[:, :2], cache=reference, return_hidden=True)
     for a, b in zip(cache, reference):
-        for x, y in zip(a.state, b.state):
+        for x, y in zip(a.cache, b.cache):
             np.testing.assert_array_equal(x, y)
     np.testing.assert_array_equal(
         model(mx.array([[25]]), cache=cache), model(mx.array([[25]]), cache=reference)

@@ -29,6 +29,10 @@ class BatchPolicy:
         self.last_seen = {}
         self.finished_at = None
         self.last_mode = None
+        self._timing_interrupted = False
+
+    def interrupt_timing(self):
+        self._timing_interrupted = True
 
     def cycle_time_ms(self, mode, started, finished):
         # Between calls, the scheduler handles responses while the previously
@@ -37,16 +41,21 @@ class BatchPolicy:
         begin = self.finished_at if self.last_mode == mode else started
         self.finished_at = finished
         self.last_mode = mode
+        if self._timing_interrupted:
+            # Prefill may have consumed pending decode work as well as wall time.
+            self._timing_interrupted = False
+            return None
         return max(0.0, (finished - begin) * 1000)
 
     def needs_standard(self):
         return self.standard_warmup > 0 or len(self.standard) < 3 or self.remaining > 0
 
     def observe_standard(self, milliseconds):
-        if self.standard_warmup:
-            self.standard_warmup -= 1
-        else:
-            self.standard.append(max(1e-6, milliseconds))
+        if milliseconds is not None:
+            if self.standard_warmup:
+                self.standard_warmup -= 1
+            else:
+                self.standard.append(max(1e-6, milliseconds))
         if self.remaining:
             self.remaining -= 1
             if not self.remaining:
@@ -69,13 +78,15 @@ class BatchPolicy:
         return len(self.uids) * expected / median(costs)
 
     def observe_mtp(self, depth, accepted, milliseconds, *, stable):
-        self.elapsed_ms += milliseconds
         for position in range(depth):
             reached = sum(count >= position for count in accepted)
             if not reached:
                 break
             rate = sum(count > position for count in accepted) / reached
             self.acceptance[position] += 0.08 * (rate - self.acceptance[position])
+        if milliseconds is None:
+            return
+        self.elapsed_ms += milliseconds
         # A depth transition combines the previous asynchronous head and a new
         # CPU dispatch shape. Wait for a complete cycle at the same depth.
         if not stable:

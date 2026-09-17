@@ -422,9 +422,9 @@ def maybe_apply_pre_load_patches(
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
     - mlx-vlm MLX 0.32.2 compatibility backport when ``for_vlm`` is True.
-      This installs before model-module imports and carries only upstream PRs
-      #1949, #1982, and #2006, without moving the deliberately stable mlx-vlm
-      pin.
+      This installs before model-module imports and carries upstream PRs
+      #1949, #1982, and #2006 plus Diffusion Gemma's mlx-lm cache API adaptation,
+      without moving the deliberately stable mlx-vlm pin.
     Some model patches inject modules into ``sys.modules`` or replace mlx-lm
     internals; the mlx-vlm compatibility hook instead transforms only the
     affected pinned sources as they load. Gating keeps non-affected models at
@@ -611,13 +611,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-    if model_type == "spark2_5":
-        from ..patches.spark2_5 import apply_spark2_5_patch
-        if apply_spark2_5_patch():
-            logger.info(
-                "Spark-X2.5 pre-load patch applied for %s",
-                model_name,
-            )
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if not for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types

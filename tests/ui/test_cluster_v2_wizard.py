@@ -1666,7 +1666,7 @@ component.selectedModelPath = '/models/m';
 
 def test_every_strategy_uses_server_autoconfigure_and_its_tp_choice():
     result = _run_wizard(
-        _WIZARD_TWO_MACS + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + """
 const bodies = [];
 function proposalFor(strategy) {
   const tp = strategy === 'pipeline' ? 1 : 2;

@@ -964,11 +964,26 @@ class Affine4KVCache(TurboQuantKVCache):
         TurboQuantKVCache.state.fset(self, value)
 
     @classmethod
+    def from_state(cls, state, meta_state=None):
+        if meta_state is None:
+            raise ValueError(f"{cls.quantization_scheme} restoration requires metadata")
+        result = cls()
+        result.state = state
+        result.meta_state = meta_state
+        result.rebuild_codecs(*result.state)
+        return result
+
+    @classmethod
     def from_cache(cls, cache, bits: float | None = None, seed: int = 0):
         result = cls(bits=bits, seed=seed)
         if cache.empty():
             return result
-        keys, values = cache.state
+        if callable(getattr(cache, "keys_and_values", None)):
+            keys, values = (
+                cache.keys_and_values() if cache.keys is not None else (None, None)
+            )
+        else:
+            keys, values = cache.state
         if keys is None:
             return result
         if type(cache) is cls and cache.seed == result.seed:

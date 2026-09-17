@@ -273,7 +273,7 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(sparse_cache[1]).__name__ == "PoolingCache"
 
     generate = importlib.import_module("mlx_lm.generate")
-    batch_cache = generate._make_cache(model, [0, 0], None)
+    batch_cache = generate._merge_caches([model.make_cache(), model.make_cache()])
     batch_tokens = mx.concatenate([prompt, prompt], axis=0)
     batch_logits = model(batch_tokens, cache=batch_cache).logits
     left_logits = model(prompt, cache=model.make_cache()).logits

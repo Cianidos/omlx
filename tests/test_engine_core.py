@@ -30,6 +30,12 @@ from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
+@pytest.fixture(autouse=True)
+def _mock_explicit_gc(monkeypatch):
+    # These engines use mock models. Real reclamation is covered in test_engine_teardown.
+    monkeypatch.setattr("gc.collect", lambda: 0)
+
+
 class TestEngineConfig:
     """Tests for EngineConfig dataclass."""
 
@@ -793,6 +799,47 @@ class TestEngineCoreGenerateCancellation:
 
 class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message, terminal",
+        [
+            ("kIOGPUCommandBufferCallbackErrorSubmissionsIgnored", True),
+            ("kIOGPUCommandBufferCallbackErrorTimeout", False),
+            ("Memory limit exceeded during prefill", False),
+        ],
+    )
+    async def test_engine_loop_gpu_error_policy(
+        self, mock_model, mock_tokenizer, message, terminal
+    ):
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        engine._running = True
+
+        def recover():
+            engine._running = False
+            return []
+
+        try:
+            with (
+                patch.object(engine.scheduler, "has_requests", return_value=True),
+                patch.object(engine, "_step_burst", side_effect=RuntimeError(message)),
+                patch.object(
+                    engine.scheduler, "fail_all_requests", side_effect=recover
+                ) as recovery,
+                patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            ):
+                if terminal:
+                    with pytest.raises(SystemExit):
+                        await engine._engine_loop()
+                    fatal.assert_called_once()
+                    recovery.assert_not_called()
+                else:
+                    await engine._engine_loop()
+                    fatal.assert_not_called()
+                    recovery.assert_called_once()
+        finally:
+            engine._running = False
+            engine.close()
 
     @pytest.mark.asyncio
     async def test_error_output_propagates_to_collector(

@@ -11,6 +11,7 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 
 
 def test_runtime_uses_exact_mlx_0322():
@@ -31,6 +32,31 @@ def test_mlx_vlm_backport_matches_every_pinned_source():
         for replacement in replacements:
             assert patched.count(replacement.new) == replacement.count
         compile(patched, str(source_path), "exec")
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_diffusion_cache_view_preserves_decoder_extent(static):
+    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import StaticPrefixKVCache
+
+    from omlx.patches.mlx_vlm_mlx0322_compat import (
+        apply_mlx_vlm_mlx0322_compat_patch,
+    )
+
+    apply_mlx_vlm_mlx0322_compat_patch()
+    from mlx_vlm.models.diffusion_gemma.language import _cache_state
+
+    cache = StaticPrefixKVCache(max_size=8) if static else KVCache()
+    assert _cache_state(cache) is None
+    keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+    values = keys + 1
+    cache.update_and_fetch(keys, values)
+    assert cache.keys.shape[2] > cache.offset
+
+    actual_keys, actual_values = _cache_state(cache)
+    assert actual_keys.shape[2] == (8 if static else 3)
+    assert mx.array_equal(actual_keys[..., :3, :], keys).item()
+    assert mx.array_equal(actual_values[..., :3, :], values).item()
 
 
 def test_mlx_vlm_qwen2_array_grid_runs_after_backport():

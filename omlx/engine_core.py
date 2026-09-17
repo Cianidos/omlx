@@ -45,7 +45,11 @@ from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
-from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
+from .utils.fatal import (
+    FATAL_TEARDOWN_TIMEOUT_S,
+    exit_if_gpu_submissions_ignored,
+    fatal_exit,
+)
 from .utils.hardware import format_bytes
 from .utils.metal_sync import clear_thread_streams
 
@@ -638,6 +642,7 @@ class EngineCore:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                exit_if_gpu_submissions_ignored(e)
                 import traceback
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")

@@ -620,6 +620,51 @@ def _has_audio_weights(model_dir: Path) -> bool:
     return False
 
 
+# Text-only oQ checkpoints can retain embed_vision without a vision tower.
+_VISION_TOWER_MARKER = "vision_tower"
+_VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
+
+
+def _is_vision_tensor_key(key: str) -> bool:
+    """True for parameter paths under `vision_tower` / `embed_vision`."""
+    return any(marker in key.split(".") for marker in _VISION_TENSOR_MARKERS)
+
+
+def _is_vision_tower_key(key: str) -> bool:
+    """Exclude orphan projection weights when detecting a vision tower."""
+    return _VISION_TOWER_MARKER in key.split(".")
+
+
+def _has_vision_tower_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains vision_tower weights."""
+    import safetensors
+
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+
+    for sf in weight_files:
+        with safetensors.safe_open(str(sf), framework="np") as f:
+            if any(_is_vision_tower_key(k) for k in f.keys()):
+                return True
+    return False
+
+
+def _vision_config_is_orphaned(model_dir: Path) -> bool:
+    """Require absent vision config and readable shards without a tower."""
+    try:
+        raw = json.loads((model_dir / "config.json").read_text())
+    except Exception:
+        return False
+    if raw.get("vision_config"):
+        return False
+    try:
+        return not _has_vision_tower_weights(model_dir)
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _strip_audio_config_if_orphaned(model_dir: Path):
     """Drop `audio_config` from `mlx_vlm.utils.load_config` results when the
@@ -679,6 +724,63 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _strip_vision_config_if_orphaned(model_dir: Path):
+    """Suppress inferred vision modules and orphan weights for text-only loads."""
+    if not _vision_config_is_orphaned(model_dir):
+        yield
+        return
+
+    import mlx.nn as _nn
+    import mlx_vlm.utils as _vu
+
+    original_update_module_configs = _vu.update_module_configs
+    original_load_weights = _nn.Module.load_weights
+    warned = False
+
+    def _patched_update_module_configs(model_config, model_class, config, modules):
+        model_config = original_update_module_configs(
+            model_config, model_class, config, modules
+        )
+        # Clear the deserialized config; the raw dict must stay valid for quantization.
+        if hasattr(model_config, "vision_config") and not config.get(
+            "vision_config"
+        ):
+            model_config.vision_config = None
+        return model_config
+
+    def _vision_filtering_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal warned
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        # MLX-format checkpoints skip upstream sanitize, leaving orphan projections.
+        owned = {k for k, _ in _nn.utils.tree_flatten(self.parameters())}
+        kept = []
+        dropped = 0
+        for key, value in weights_items:
+            if _is_vision_tensor_key(key) and key not in owned:
+                dropped += 1
+                continue
+            kept.append((key, value))
+        if dropped and not warned:
+            warned = True
+            logger.warning(
+                "vision_tower weights missing for %s; loading without "
+                "vision support",
+                model_dir.name,
+            )
+        return original_load_weights(self, kept, *args, **kwargs)
+
+    _vu.update_module_configs = _patched_update_module_configs
+    _nn.Module.load_weights = _vision_filtering_load_weights
+    try:
+        yield
+    finally:
+        _vu.update_module_configs = original_update_module_configs
+        _nn.Module.load_weights = original_load_weights
 
 
 @contextlib.contextmanager
@@ -1842,6 +1944,7 @@ class VLMBatchedEngine(BaseEngine):
             apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
@@ -2644,11 +2747,22 @@ class VLMBatchedEngine(BaseEngine):
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
             from mlx_vlm.tool_parsers import (
-                _infer_tool_parser,
+                _EXTRA_PATTERNS,
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            from mlx_lm.tokenizer_utils import _infer_tool_parser
+
+            tool_parser_type = _infer_tool_parser(tokenizer)
+            if tool_parser_type is None and isinstance(chat_template, str):
+                tool_parser_type = next(
+                    (
+                        name
+                        for marker, name in _EXTRA_PATTERNS
+                        if marker in chat_template
+                    ),
+                    None,
+                )
             if tool_parser_type is None:
                 return
             try:
@@ -2666,7 +2780,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             except ImportError:
                 return
-            tool_parser_type = _mlx_lm_infer(chat_template)
+            tool_parser_type = _mlx_lm_infer(tokenizer)
             if tool_parser_type is None:
                 return
             try:

@@ -743,15 +743,26 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     model.close()
 
 
-@pytest.mark.parametrize("direct", [False, True])
-def test_real_vlm_engine_text_and_images(tmp_path, direct):
+def test_real_vlm_engine_text_and_images(tmp_path):
     import subprocess
 
-    script = (
-        "import asyncio,sys; from pathlib import Path; "
-        "sys.path.insert(0,sys.argv[1]); import test_deepseek_v41 as t; "
-        "asyncio.run(t._run_vlm_engine(Path(sys.argv[2]), sys.argv[3] == '1'))"
-    )
+    script = """
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import test_deepseek_v41 as t
+
+async def main():
+    for direct in (False, True):
+        root = Path(sys.argv[2]) / ("direct" if direct else "converted")
+        root.mkdir()
+        print(f"Testing {root.name} checkpoint", flush=True)
+        await asyncio.wait_for(t._run_vlm_engine(root, direct), timeout=60)
+
+asyncio.run(main())
+"""
     # Engine startup installs process-wide Metal routes. Keep those real hooks
     # in a subprocess so unrelated estimator unit tests retain their fixtures.
     result = subprocess.run(
@@ -761,11 +772,10 @@ def test_real_vlm_engine_text_and_images(tmp_path, direct):
             script,
             str(Path(__file__).parent),
             str(tmp_path),
-            "1" if direct else "0",
         ],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

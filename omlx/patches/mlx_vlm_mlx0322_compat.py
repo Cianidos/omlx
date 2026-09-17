@@ -8,9 +8,12 @@ a proxy whose member arrays must be updated in place. Affected models otherwise
 fail in speculative RNG restoration, ``mx.repeat``, shape construction, or
 Metal grid dispatch.
 
+The mlx-lm cache API also stores metadata in ``state``. Diffusion Gemma must
+read valid K/V tensors through ``keys_and_values`` instead.
+
 Moving the mlx-vlm pin to any of these merge commits would also import hundreds of
 unrelated upstream changes. Instead, this module installs a source loader for
-the exact affected modules and applies only the upstream integer conversions.
+the exact affected modules and applies the required API corrections.
 Each replacement is checked before compilation: an unexpected pinned source
 fails loudly instead of leaving a partially applied compatibility patch.
 """
@@ -41,6 +44,9 @@ _REPEAT_GRID = _Replacement(
 )
 
 _MODULE_REPLACEMENTS: dict[str, tuple[_Replacement, ...]] = {
+    "mlx_vlm.models.diffusion_gemma.language": (
+        _Replacement("return cache.state", "return cache.keys_and_values()"),
+    ),
     "mlx_vlm.speculative.common": (
         _Replacement(
             "mx.random.state[i] = value",

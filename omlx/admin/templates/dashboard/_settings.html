@@ -1,4 +1,4 @@
-            <div x-show="mainTab === 'settings'" x-cloak>
+            <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
             <!-- Tab Navigation -->
             <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
                 <button
@@ -1204,7 +1204,11 @@
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.pdf_processing_engine') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.pdf_processing_engine_hint') }}</p>
-                                        <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown'"
+                                        <p x-show="markitdownOcrModelMissing"
+                                           class="text-xs text-amber-600 mt-1">
+                                            {{ t('settings.integrations.markitdown.pdf_processing_missing_model') }}
+                                        </p>
+                                        <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown' || markitdownOcrModelMissing"
                                            class="text-xs text-amber-600 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_markitdown_warning') }}
                                         </p>
@@ -1213,6 +1217,10 @@
                                             @change="saveIntegrationSettings()"
                                             class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="markitdown">{{ t('settings.integrations.markitdown.section_label') }}</option>
+                                        <template x-if="markitdownOcrModelMissing">
+                                            <option :value="globalSettings.integrations.markitdown_pdf_processing_engine"
+                                                    x-text="globalSettings.integrations.markitdown_pdf_processing_engine"></option>
+                                        </template>
                                         <template x-for="model in markitdownOcrModels" :key="model.id">
                                             <option :value="model.id" x-text="model.id"></option>
                                         </template>

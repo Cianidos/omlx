@@ -427,7 +427,8 @@ def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_er
                 has_tool_calling=False,
                 has_thinking=False,
                 tool_parser=lambda *_args: {},
-                sequences={},
+                text_sm=None,
+                initial_state="normal",
                 prompt=[],
             )
             ctx.stop()

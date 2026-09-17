@@ -662,8 +662,18 @@ def test_matches_upstream_without_layer_concatenation(rows, depth, accept_kind):
     assert calls == [rows] * 3
     for actual, reference in zip(caches, expected):
         mx.eval(actual.state, reference.state)
+        actual_values = (
+            actual.keys_and_values()
+            if isinstance(actual, BatchKVCache)
+            else actual.cache
+        )
+        reference_values = (
+            reference.keys_and_values()
+            if isinstance(reference, BatchKVCache)
+            else reference.cache
+        )
         assert all(
-            bool(mx.array_equal(a, b)) for a, b in zip(actual.state, reference.state)
+            bool(mx.array_equal(a, b)) for a, b in zip(actual_values, reference_values)
         )
         if isinstance(actual, BatchKVCache):
             assert actual._idx == reference._idx

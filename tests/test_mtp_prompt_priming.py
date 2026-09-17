@@ -86,7 +86,7 @@ def _tokens(n, seed=0):
 def _kv_entries(mtp_cache):
     out = []
     for c in mtp_cache:
-        keys, values = c.state
+        keys, values = c.keys_and_values()
         out.append((keys, values))
     return out
 

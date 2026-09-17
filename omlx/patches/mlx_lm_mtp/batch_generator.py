@@ -114,11 +114,12 @@ def apply() -> bool:
                             "standard", started, time.perf_counter()
                         )
                         policy.observe_standard(elapsed)
-                        logger.debug(
-                            "Lightning MTP ordinary batch sample: rows=%d ms=%.3f",
-                            len(self.uids),
-                            elapsed,
-                        )
+                        if elapsed is not None:
+                            logger.debug(
+                                "Lightning MTP ordinary batch sample: rows=%d ms=%.3f",
+                                len(self.uids),
+                                elapsed,
+                            )
                     return result
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
@@ -154,7 +155,10 @@ def apply() -> bool:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
-                            _reconcile_mtp_to_standard(self, active)
+                            if not _reconcile_mtp_to_standard(self, active):
+                                raise RuntimeError(
+                                    "Lightning MTP could not restore the committed cache"
+                                ) from exc
                             if active.reentry_probe:
                                 try:
                                     delattr(self, "_omlx_mtp_park_state")
@@ -180,23 +184,8 @@ def apply() -> bool:
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
-            active = getattr(self, "_omlx_mtp_batch_state", None)
-            if (
-                active is not None
-                and all(not state.queue for state in active.states.values())
-                and not _generation_batch_has_active_mtp(batch)
-            ):
-                # Completed ragged emits leave each UID at its own frontier.
-                # Preserve those histories; only newly admitted UIDs need priming.
-                from . import batched_head
-
-                batched_head.flush(active)
-                return original_extend(self, batch, *args, **kwargs)
-            # The host (self) may have active MTP about to gain a co-runner.
-            # The MTP path never maintains mlx-lm's _next_tokens, so a plain
-            # drop here would leave standard batched decode resuming from a
-            # stale _next_tokens against an MTP-advanced cache. Reconcile
-            # before merge while ownership is still well defined.
+            # Reconcile before adding rows without MTP state so the drained
+            # batch can feed its last tokens without replaying its history.
             if not _reconcile_mtp_batch_to_standard(self):
                 raise RuntimeError(
                     "Lightning MTP could not restore the committed batch cache"
@@ -210,7 +199,10 @@ def apply() -> bool:
                     park_state = _mtp_park_state_for_batch(self)
                     if park_state is not None:
                         park_state.defer_probe()
-                _reconcile_mtp_to_standard(self, host_state)
+                if not _reconcile_mtp_to_standard(self, host_state):
+                    raise RuntimeError(
+                        "Lightning MTP could not restore the committed cache"
+                    )
                 _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
@@ -304,13 +296,24 @@ def apply() -> bool:
                         self.completion_batch_size = old_completion_batch_size
                     elif hasattr(self, "completion_batch_size"):
                         delattr(self, "completion_batch_size")
-            return original_bg_next(self, *args, **kwargs)
+            result = original_bg_next(self, *args, **kwargs)
+            if result[0]:
+                interrupt_batch_timing(self)
+            return result
 
         BatchGenerator._next = patched_bg_next
         BatchGenerator.remove = patched_bg_remove
         BatchGenerator.close = patched_bg_close
         BatchGenerator._omlx_mtp_patched = True
     return True
+
+
+def interrupt_batch_timing(generator: Any) -> None:
+    """Exclude a prefill-interrupted interval from batch cost learning."""
+    batch = getattr(generator, "_generation_batch", None)
+    policy = getattr(batch, "_omlx_mtp_batch_policy", None)
+    if policy is not None:
+        policy.interrupt_timing()
 
 
 def _model_has_mtp_module(model: Any) -> bool:
@@ -1045,7 +1048,7 @@ def _make_row_batch(
         logits_processors=[
             _row_value(getattr(gen_batch, "logits_processors", None), idx, [])
         ],
-        state_machines=[_row_value(getattr(gen_batch, "state_machines", None), idx)],
+        stop_sequences=[_row_value(getattr(gen_batch, "stop_sequences", None), idx)],
         max_tokens=[_row_value(getattr(gen_batch, "max_tokens", None), idx)],
         _next_tokens=next_tokens[idx : idx + 1] if next_tokens is not None else None,
         _next_logprobs=(
@@ -1055,7 +1058,7 @@ def _make_row_batch(
         ),
         _token_context=[gen_batch._token_context[idx]],
         _num_tokens=[gen_batch._num_tokens[idx]],
-        _matcher_states=[gen_batch._matcher_states[idx]],
+        _matchers=[gen_batch._matchers[idx]],
     )
     if state is not None:
         row._omlx_mtp_state = state
@@ -1300,17 +1303,12 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
-    """Build a fresh single-sequence batch-aware cache (left_padding=[0]).
-
-    Reuses mlx-lm's own ``_make_cache`` so the per-layer types match exactly
-    what ``extend()`` / ``_extend_cache`` expects, keeping the subsequent merge
-    type-compatible. Returns None if the converter is unavailable.
-    """
-    import sys
+    """Build a fresh cache through the same merge path as prompt processing."""
+    from mlx_lm.models.cache import make_prompt_cache
+    from omlx.scheduler import _patched_merge_caches
 
     try:
-        make_cache = sys.modules["mlx_lm.generate"]._make_cache
-        return make_cache(model, [0], None)
+        return _patched_merge_caches([make_prompt_cache(model)])
     except Exception as exc:
         logger.warning("MTP reconcile: cache rebuild unavailable: %s", exc)
         return None
@@ -1335,7 +1333,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
 
     Leaves ``tokens[0]`` / ``_num_tokens[0]`` untouched (they already reflect
     streamed tokens), so there is no duplicated or skipped token. Returns False
-    (caller falls back to a plain drop) when reconcile cannot be done safely.
+    when reconcile cannot be done safely; callers must stop decoding.
     """
     import mlx.core as mx
 
@@ -1355,8 +1353,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         logits = None
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
         for start in range(0, total, step):
-            logits, _, _ = _call_backbone(
-                gen_batch.model, tok_arr[None, start : start + step], new_cache
+            # Committed history needs no per-token speculative rollback states.
+            logits = gen_batch.model(
+                tok_arr[None, start : start + step], cache=new_cache
             )
             if start + step < total:
                 mx.eval(logits)
@@ -1367,16 +1366,15 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_tok = mx.array([int(next_id)], dtype=mx.uint32)
             next_lp = next_lp_1d
         else:
-            prev_buf = gen_batch._token_context[0].tokens if procs is not None else None
+            prev_buf = (
+                mx.array(list(tokens), dtype=mx.int32) if procs is not None else None
+            )
             ll = _apply_processors(procs, prev_buf, last_logits)
             next_lp_2d = _logprobs(ll)
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
-        # Reconciliation produces committed standard-decoding state. A long
-        # re-prefill is still an armed MTP-managed backbone call, so discard
-        # its speculative snapshots before exposing or merging the cache.
         _clear_rollback(new_cache)
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok
@@ -1393,7 +1391,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         )
         return True
     except Exception as exc:
-        logger.warning("MTP reconcile failed, falling back to plain drop: %s", exc)
+        logger.warning("MTP reconcile failed: %s", exc)
         return False
 
 
@@ -2701,14 +2699,15 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
             state.stats.accepts - count for state, (_, count) in zip(states, previous)
         ]
         policy.observe_mtp(depths[0], accepted, elapsed, stable=depths[0] == requested)
-        logger.debug(
-            "Lightning MTP batch cost: rows=%d depth=%d accepts=%s ms=%.3f next_depth=%d",
-            len(states),
-            depths[0],
-            accepted,
-            elapsed,
-            policy.cur,
-        )
+        if elapsed is not None:
+            logger.debug(
+                "Lightning MTP batch cost: rows=%d depth=%d accepts=%s ms=%.3f next_depth=%d",
+                len(states),
+                depths[0],
+                accepted,
+                elapsed,
+                policy.cur,
+            )
         if policy.should_park():
             if not _reconcile_mtp_batch_to_standard(gen_batch):
                 raise RuntimeError(
@@ -2760,14 +2759,7 @@ def _emit_ragged_responses(
             gen_batch._num_tokens[idx] += 1
             if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
                 finish_reason = "length"
-            new_state, match_sequence, current_state = gen_batch.state_machines[
-                idx
-            ].match(
-                gen_batch._matcher_states[idx],
-                token_id,
-            )
-            gen_batch._matcher_states[idx] = new_state
-            if match_sequence is not None and current_state is None:
+            if gen_batch._matchers[idx].advance(token_id):
                 finish_reason = "stop"
             if finish_reason is not None:
                 responses.append(
@@ -2776,8 +2768,6 @@ def _emit_ragged_responses(
                         token=token_id,
                         logprobs=logprobs_1d,
                         finish_reason=finish_reason,
-                        current_state=current_state,
-                        match_sequence=match_sequence,
                         prompt_cache=gen_batch.extract_cache(idx),
                         all_tokens=gen_batch.tokens[idx],
                     )
@@ -2793,8 +2783,6 @@ def _emit_ragged_responses(
                     token=token_id,
                     logprobs=logprobs_1d,
                     finish_reason=None,
-                    current_state=current_state,
-                    match_sequence=match_sequence,
                     prompt_cache=None,
                     all_tokens=None,
                 )
@@ -2860,21 +2848,18 @@ def _feed_batch_mains_to_standard(gen_batch: Any, batch_state: _MtpBatchState) -
 
 
 def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
-    """Materialize ``state.next_main`` and sample its successor.
+    """Materialize the committed main token and sample its successor.
 
-    At a cycle boundary with an empty queue the cache is exactly one token
-    behind the streamed sequence: ``state.next_main`` (already streamed) has
-    no KV yet. Feed it through the backbone, sample ``_next_tokens`` from
-    the resulting logits, and leave the batch in the standard-resumable
-    state. Shared by the depth-0 park and the late-join handoff. Returns
-    False on failure with the batch untouched.
+    A failed one-token handoff retries once by rebuilding committed history.
+    Only an absent main token returns False; failed recovery stops decoding.
     """
     import mlx.core as mx
 
     if state.next_main is None:
         return False
+    procs = _proc_list(gen_batch)
+    snapshot = _snap_snapshotable(procs)
     try:
-        procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         prev_buf = None
         if procs is not None:
@@ -2888,10 +2873,14 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         mx.eval(next_tok)
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
+        _clear_rollback(gen_batch.prompt_cache)
     except Exception as exc:
-        logger.debug("MTP feed-to-standard handoff failed: %s", exc)
-        return False
-    _clear_rollback(gen_batch.prompt_cache)
+        logger.warning("MTP handoff failed; rebuilding committed cache: %s", exc)
+        _restore_snapshotable(procs, snapshot)
+        if not _reconcile_mtp_to_standard(gen_batch, state):
+            raise RuntimeError(
+                "Lightning MTP could not restore the committed cache"
+            ) from exc
     return True
 
 
@@ -2977,16 +2966,17 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
+    result = _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
     if (
         state.chain
         and state.controller is not None
         and state.controller.should_exit()
         and not state.queue
+        and result[0].finish_reason is None
     ):
-        # Emit this cycle's token either way; on a successful handoff the
-        # next next() call runs the standard step with _next_tokens set.
+        # Record the emitted token before a handoff can rebuild its history.
         _park_mtp_to_standard(gen_batch, state)
-    return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+    return result
 
 
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
@@ -3269,12 +3259,11 @@ def _run_verify_cycle_chain(
 
     remaining = gen_batch.max_tokens[0] - gen_batch._num_tokens[0]
     limit = max(0, remaining - 1)
-    matcher_state = gen_batch._matcher_states[0]
+    from copy import copy
+
+    matcher = copy(gen_batch._matchers[0])
     for j, token in enumerate(draft_ids[:m] + [emit_last_id]):
-        matcher_state, match, current = gen_batch.state_machines[0].match(
-            matcher_state, token
-        )
-        if match is not None and current is None:
+        if matcher.advance(token):
             limit = min(limit, j)
             break
     if limit < m:
@@ -3757,18 +3746,13 @@ def _emit_response(
     Response = type(gen_batch).Response
 
     finish_reason: Optional[str] = None
-    match_sequence = None
 
     gen_batch.tokens[0].append(token_id)
     gen_batch._num_tokens[0] += 1
     if gen_batch._num_tokens[0] >= gen_batch.max_tokens[0]:
         finish_reason = "length"
 
-    new_state, match_sequence, current_state = gen_batch.state_machines[0].match(
-        gen_batch._matcher_states[0], token_id
-    )
-    gen_batch._matcher_states[0] = new_state
-    if match_sequence is not None and current_state is None:
+    if gen_batch._matchers[0].advance(token_id):
         finish_reason = "stop"
 
     if finish_reason is not None:
@@ -3779,8 +3763,6 @@ def _emit_response(
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=finish_reason,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
@@ -3802,8 +3784,6 @@ def _emit_response(
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=None,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=None,
             all_tokens=None,
         )
