@@ -1984,5 +1984,12 @@
   "usage.delayed": "История может быть неполной: запись задерживается или буфер ожидания переполнен.",
   "usage.loading": "Загрузка данных об использовании…",
   "usage.disabled": "История использования отключена. Включите её в разделе Настройки → История использования.",
-  "usage.open_settings": "Открыть настройки"
+  "usage.open_settings": "Открыть настройки",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Отмена"
 }

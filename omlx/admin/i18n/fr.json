@@ -1984,5 +1984,12 @@
   "usage.delayed": "L'historique peut être incomplet : le stockage est retardé ou le tampon en attente a débordé.",
   "usage.loading": "Chargement de l'utilisation…",
   "usage.disabled": "L'historique d'utilisation est désactivé. Activez-le dans Paramètres → Historique d'utilisation.",
-  "usage.open_settings": "Ouvrir les paramètres"
+  "usage.open_settings": "Ouvrir les paramètres",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Annuler"
 }

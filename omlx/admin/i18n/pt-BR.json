@@ -1984,5 +1984,12 @@
   "usage.delayed": "O histórico pode estar incompleto: o armazenamento está atrasado ou o buffer pendente transbordou.",
   "usage.loading": "Carregando uso…",
   "usage.disabled": "O histórico de uso está desativado. Ative-o em Configurações → Histórico de uso.",
-  "usage.open_settings": "Abrir configurações"
+  "usage.open_settings": "Abrir configurações",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Cancelar"
 }

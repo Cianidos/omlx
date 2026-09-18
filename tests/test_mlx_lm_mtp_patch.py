@@ -4755,6 +4755,61 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
         mlx_lm_mtp.set_mtp_depth(previous_depth)
 
 
+def _cache_rows(cache):
+    for layer in cache or ():
+        offset = getattr(layer, "offset", None)
+        if isinstance(offset, mx.array) and offset.ndim == 1:
+            return int(offset.size)
+    return None
+
+
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
+def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    try:
+        mx.random.seed(173)
+        model = _model(family)
+        host = model._language_model
+        mx.eval(model.parameters())
+        prompts = [[3, 4, 5, 6, 7], [3, 6, 7, 8, 4, 5, 6], [4, 5, 6]]
+        limits = [18, 22, 17]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits)
+        host._omlx_mtp_decode_enabled = True
+        # Force boundary crossings within the short generation.
+        model._omlx_mtp_commit_align = 4
+        materialized = []
+        last_verify_rows = [0]
+        original_materialize = bg._materialize_mtp_boundary_emit
+
+        def materialize(row, state):
+            materialized.append(last_verify_rows[0])
+            return original_materialize(row, state)
+
+        original_backbone = bg._call_backbone
+
+        def backbone(target, inputs, cache, n_confirmed=0):
+            rows = _cache_rows(cache)
+            assert rows is None or rows == int(inputs.shape[0])
+            if n_confirmed:
+                last_verify_rows[0] = int(inputs.shape[0])
+            return original_backbone(target, inputs, cache, n_confirmed)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        monkeypatch.setattr(bg, "_call_backbone", backbone)
+        actual, _ = generate(model, prompts, limits)
+        assert actual == expected
+        assert any(rows > 1 for rows in materialized)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch):
     from mlx_vlm.models.qwen3_5 import speculative_verifier

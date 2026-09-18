@@ -606,6 +606,49 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert model.forward_kwargs["capture_layer_ids"] == [1]
 
 
+@pytest.mark.parametrize(
+    ("module_name", "cache_name"),
+    [
+        ("mlx_lm.models.cache", "BatchKVCache"),
+        ("mlx_lm.models.cache", "BatchRotatingKVCache"),
+        ("mlx_vlm.models.cache", "BatchKVCache"),
+        ("mlx_vlm.models.cache", "BatchRotatingKVCache"),
+        ("mlx_vlm.models.cache", "BatchQuantizedKVCache"),
+    ],
+)
+def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cache_name):
+    import importlib
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+
+    qwen35_vlm_runtime._patch_batch_cache_padding_identity()
+
+    cache_class = getattr(importlib.import_module(module_name), cache_name)
+    kwargs = {"max_size": 32} if cache_name == "BatchRotatingKVCache" else {}
+    cache = cache_class(left_padding=[2, 0], **kwargs)
+    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 0), 2)
+
+    cache.prepare(lengths=[6, 3], right_padding=[0, 3])
+    keys = mx.zeros((2, 1, 6, 64))
+    cache.update_and_fetch(keys, keys)
+    cache.finalize()
+
+    assert cache.left_padding.tolist() == [2, 3]
+    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
+    assert q35_lang._create_qwen3_5_attention_mask(mx.zeros((2, 1, 4)), cache)
+    assert cache._qwen3_5_decode_left_padding == [2, 3]
+
+    padding = cache.left_padding
+    padding_info = cache._qwen3_5_left_padding_info
+    cache.prepare(lengths=[1, 1], right_padding=[0, 0])
+    cache.finalize()
+    assert cache.left_padding is padding
+    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
+    assert cache._qwen3_5_left_padding_info is padding_info
+
+
 def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():
     """The dense Qwen3.5 runtime patch must not wire foreign subclasses."""
     from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime

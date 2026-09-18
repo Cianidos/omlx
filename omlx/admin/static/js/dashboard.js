@@ -924,7 +924,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -999,6 +1064,8 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
@@ -1032,6 +1099,7 @@
             },
 
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1086,6 +1154,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
@@ -1147,6 +1216,10 @@
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {

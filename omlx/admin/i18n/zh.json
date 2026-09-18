@@ -1984,5 +1984,12 @@
   "usage.delayed": "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。",
   "usage.loading": "正在加载使用量…",
   "usage.disabled": "使用历史已关闭。请在设置 → 使用历史中开启。",
-  "usage.open_settings": "打开设置"
+  "usage.open_settings": "打开设置",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "取消"
 }
