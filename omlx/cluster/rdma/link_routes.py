@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 
@@ -24,6 +25,9 @@ from .links import discover_links
 from .store import RdmaLinkStore, get_rdma_link_store
 from .verification import cached_driver_identity, link_identity, read_driver_identity
 from .words import load_word_ops
+
+# claim_link lets an owner claim again, and every dashboard verification is VERIFYING.
+_verify_claim_lock = threading.Lock()
 
 
 class RdmaLinkVerifyRequest(BaseModel):
@@ -98,7 +102,8 @@ def _verify(name: str) -> dict[str, Any]:
             status_code=409,
             detail=link.reason or f"link {name} does not reach an enrolled worker",
         )
-    owner = claim_link(name, VERIFYING)
+    with _verify_claim_lock:
+        owner = claimed_links().get(name) or claim_link(name, VERIFYING)
     if owner is not None:
         raise HTTPException(
             status_code=409, detail=f"link {name} is in use by {describe_owner(owner)}"

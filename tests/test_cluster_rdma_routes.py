@@ -194,6 +194,11 @@ def test_inventory_marks_a_link_under_verification(client):
             "in use by deployment cluster-rdma",
         ),
         (
+            lambda mp: launch_links.claim_link("linka", launch_links.VERIFYING),
+            409,
+            "in use by a dashboard verification",
+        ),
+        (
             lambda mp: mp.setattr(link_routes, "enrolled_node_addresses", lambda: ()),
             409,
             "no enrolled node",
