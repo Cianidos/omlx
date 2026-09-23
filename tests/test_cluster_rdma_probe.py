@@ -162,6 +162,26 @@ def test_serving_stops_once_the_probe_is_abandoned(link):
     assert summary["ended"] == "abandoned"
 
 
+def test_the_service_stays_registered_until_the_daemon_takes_bye(link):
+    # mcdma-rpcd drops a staged reply once its service detaches.
+    link.hold_replies = True
+    thread, result = _serve_in_thread(link)
+    client = ClientMailbox.attach(link.name, PythonWordOps())
+    try:
+        end = probe_wire.pack_request(probe_wire.ProbeRequest(probe_wire.END))
+        seq = client.stage((end,))
+        thread.join(timeout=0.2)
+        assert thread.is_alive()
+        link.hold_replies = False
+        reply = client.wait(seq, 5.0)
+        assert reply is not None and bytes(reply) == probe_wire.BYE
+    finally:
+        link.hold_replies = False
+        client.close()
+    thread.join(timeout=10)
+    assert result["summary"]["ended"] == "end"
+
+
 def test_one_flipped_byte_fails_the_probe(link):
     thread, _ = _serve_in_thread(link)
     client = ClientMailbox.attach(link.name, PythonWordOps())

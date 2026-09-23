@@ -18,6 +18,8 @@ CONNECTED_FLAG = 64
 GENERATION_WORD = 72
 # Request half, both ends: request and reply half sizes as two u64 values.
 SIZES = 256
+# Reply half, service end: the listen daemon stores a staged reply's word here before it sends the reply.
+READY_WORD = 0
 # Reply half, client end: the service's reply has landed.
 DONE_WORD = 64
 # Reply half, service end: a reply is staged for the daemon to send.

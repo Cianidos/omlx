@@ -17,6 +17,8 @@ from . import probe_wire
 from .mailbox import MailboxError, ServiceMailbox
 from .words import load_word_ops
 
+_BYE_SENT_TIMEOUT_S = 5.0
+
 
 def _stdin_closed() -> bool:
     """Whether stdin reached end of file, which is how the coordinator's SSH client going away shows up here."""
@@ -75,6 +77,9 @@ def serve_probe(
             served["source"] += 1
         else:
             mailbox.reply(seq, (probe_wire.BYE,))
+            # mcdma-rpcd drops a staged reply once its service detaches, so stay until BYE is taken.
+            if not mailbox.wait_sent(seq, timeout_s=_BYE_SENT_TIMEOUT_S):
+                return {"ended": "bye not sent", "served": served}
             return {"ended": "end", "served": served}
 
 

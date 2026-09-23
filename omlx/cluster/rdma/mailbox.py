@@ -242,6 +242,11 @@ class ServiceMailbox(_Mailbox):
             self.sizes.request + layout.STAGED_WORD, layout.pack_word(seq, length)
         )
 
+    def wait_sent(self, seq: int, timeout_s: float) -> bool:
+        """Whether the daemon took reply `seq` for sending within `timeout_s`."""
+        ready = self.sizes.request + layout.READY_WORD
+        return bool(self._wait(ready, seq, equal=True, timeout_s=timeout_s))
+
     def close(self) -> None:
         """Detach from the daemon; it keeps the mailbox file."""
         self._release()

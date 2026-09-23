@@ -91,6 +91,8 @@ class LoopbackLink:
         # What STATUS on the service socket reports for this link, as the listen daemon would.
         self.link_up = True
         self.corrupt_next_reply = False
+        # While set, staged replies wait in the mailbox as if the daemon had not reached them yet.
+        self.hold_replies = False
         # Replies carried from the service to the client, so tests can prove traffic used the link.
         self.replies = 0
         self._stop = threading.Event()
@@ -128,9 +130,14 @@ class LoopbackLink:
                 ]
                 _set(self.service, layout.REQUEST_WORD, word)
             staged = _get(self.service, self.request + layout.STAGED_WORD)
-            if layout.word_seq(staged) and layout.word_seq(staged) != last_staged:
+            if (
+                not self.hold_replies
+                and layout.word_seq(staged)
+                and layout.word_seq(staged) != last_staged
+            ):
                 last_staged = layout.word_seq(staged)
                 length = layout.word_length(staged)
+                _set(self.service, self.request + layout.READY_WORD, staged)
                 start = self.request + layout.CTRL
                 self.client[start : start + length] = self.service[
                     start : start + length

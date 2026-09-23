@@ -120,6 +120,7 @@ control page. A word is `seq << 32 | length`, and sequence 0 means empty.
 | request +64 | client | 1 while the daemon's link to the peer is up |
 | request +72 | client | Link generation: bumped each time the daemon's link comes up |
 | request +256 | both | `R` and `P` as two little-endian u64 values |
+| reply +0 | service | Ready word: the daemon took the staged reply to send it |
 | reply +64 | client | Reply word: the service's reply has landed |
 | reply +128 | service | Staged word: a reply is ready for the daemon to send |
 
@@ -134,7 +135,10 @@ default `/tmp/mcdma-rpcd.NAME.sock`) and sending `MODE poll`. The daemon answers
 `OK`, or `ERR busy` if another service holds the link. After `OK` it sends
 nothing more until the registration ends, then `BYE` or a closed socket, so any
 byte on that socket means the service has lost the link. The registration ends
-when the link drops, since requests in flight are lost with it.
+when the link drops, since requests in flight are lost with it. A service that
+stops after a reply keeps its registration until the ready word carries that
+reply's sequence, because the daemon drops a staged reply once its service is
+gone.
 
 The connect daemon's control socket answers `STATUS` with an optional
 `VERSION mcdma-rpcd 1 RELEASE` line, one line per peer and a final `END`:
