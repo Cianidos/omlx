@@ -949,7 +949,7 @@ def test_preflight_charges_observed_max_transient():
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits
 
-    scheduler._prefill_transient_tracker._observed_max_bytes = (
+    scheduler._prefill_transient_tracker._dense_history.observed_max_bytes = (
         est.transient + 2 * 1024**3
     )
     with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):

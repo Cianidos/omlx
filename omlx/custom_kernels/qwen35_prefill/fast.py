@@ -99,6 +99,11 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_q4_swiglu_down_t",
     "qwen35_ane_dual_q4_swiglu_down_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
+    "oq_a8_kernels_available",
+    "qwen35_oq_a8_quantize",
+    "qwen35_oq_a8_qmm_t",
+    "qwen35_oq_a8_decode_weights",
+    "qwen35_oq_a8_stage_a_v8",
 )
 
 
@@ -824,14 +829,13 @@ _nax_available_cache: bool | None = None
 _stock_nax_cache: bool | None = None
 _qmm_nax_cache: bool | None = None
 
-# Explicit tile override. When unset, the first NAX qmm dispatch runs a short
-# on-device autotune over the candidate tiles and caches the fastest for this
-# chip (see _resolve_qmm_nax_variant).
-_QMM_NAX_VARIANT_OVERRIDE = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT")
-QMM_NAX_VARIANT = (
-    int(_QMM_NAX_VARIANT_OVERRIDE) if _QMM_NAX_VARIANT_OVERRIDE is not None else 0
-)
+# Bundled NAX tiles (must match qwen_q_affine_nax_variant in qwen35_prefill.cpp):
+#   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
+#   3: bn 128   4: bk 32   5: wm4 wn1
+NAX_QMM_VARIANTS = range(6)
+QMM_NAX_VARIANT = 0
 _qmm_nax_variant_resolved: int | None = None
+_qmm_nax_variant_warned = False
 
 
 def _nax_available_fallback(
@@ -946,7 +950,7 @@ def _qmm_use_nax() -> bool:
 
 
 def _autotune_qmm_nax_variant() -> int:
-    """Measure the candidate NAX tiles on this chip and return the fastest.
+    """Measure bundled NAX tiles on this chip and return the fastest.
 
     Runs once, on the first NAX qmm dispatch, on a prefill-sized GEMM. The
     optimum tile varies with the tensor-unit count, so it is probed on device
@@ -957,11 +961,9 @@ def _autotune_qmm_nax_variant() -> int:
     if _ext is None or not hasattr(_ext, "qwen35_q4_affine_qmm_t"):
         return 0
     m, k, n = 2048, 5120, 17408
-    # Probe the viable tile variants and keep the fastest on this chip rather
-    # than assuming one fits all M5 tiers. (bm=32 / bk=32 tiles are skipped:
-    # this kernel only runs at prefill M >= 2048, where they lose.) ~0.3s
-    # one-time cost on first NAX qmm dispatch.
-    candidates = (0, 2, 3, 5, 6)
+    # Skip the small bm/bk tiles: this kernel only runs at prefill M >= 2048,
+    # where they lose. The remaining candidates cost ~0.3s once per process.
+    candidates = (0, 2, 3, 5)
     try:
         x = mx.random.uniform(shape=(m, k)).astype(mx.float16)
         w = mx.random.uniform(shape=(n, k)).astype(mx.float16)
@@ -972,6 +974,7 @@ def _autotune_qmm_nax_variant() -> int:
         return 0
     best_variant, best_time = 0, float("inf")
     for variant in candidates:
+
         def run(v=variant):
             return _ext.qwen35_q4_affine_qmm_t(
                 x,
@@ -983,6 +986,7 @@ def _autotune_qmm_nax_variant() -> int:
                 nax_variant=v,
                 group_size=64,
             )
+
         try:
             y = run()
             mx.eval(y)
@@ -1002,15 +1006,30 @@ def _autotune_qmm_nax_variant() -> int:
 
 
 def _resolve_qmm_nax_variant() -> int:
-    """Return the NAX tile variant: explicit env override, else autotune once."""
-    global _qmm_nax_variant_resolved, QMM_NAX_VARIANT
-    if _QMM_NAX_VARIANT_OVERRIDE is not None:
-        return int(_QMM_NAX_VARIANT_OVERRIDE)
+    """Return validated env override, or autotune once when unset."""
+    global _qmm_nax_variant_resolved, _qmm_nax_variant_warned, QMM_NAX_VARIANT
+    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT")
+    if raw is not None:
+        try:
+            variant = int(raw.strip())
+        except ValueError:
+            variant = -1
+        if variant in NAX_QMM_VARIANTS:
+            return variant
+        if not _qmm_nax_variant_warned:
+            _qmm_nax_variant_warned = True
+            logger.warning(
+                "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
+                "(valid: 0-%d); using variant 0",
+                raw,
+                NAX_QMM_VARIANTS[-1],
+            )
+        return 0
     if _qmm_nax_variant_resolved is None:
         _qmm_nax_variant_resolved = _autotune_qmm_nax_variant()
         QMM_NAX_VARIANT = _qmm_nax_variant_resolved
         logger.info(
-            "Qwen qmm NAX tile autotuned -> variant %d", _qmm_nax_variant_resolved
+            "Qwen qmm NAX tile autotuned: variant %d", _qmm_nax_variant_resolved
         )
     return _qmm_nax_variant_resolved
 
@@ -1239,6 +1258,160 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+# --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
+
+OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
+OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
+
+
+def oq_a8_available() -> bool:
+    """True when the INT8 NAX GEMM can actually run on this machine.
+
+    Distinct from ``has_symbol``: the binding can exist in a build whose NAX
+    metallib was skipped (SDK < 26.2) or on hardware without tensor units.
+    """
+    if _ext is None or not hasattr(_ext, "oq_a8_kernels_available"):
+        return False
+    try:
+        return bool(_ext.oq_a8_kernels_available())
+    except Exception:
+        return False
+
+
+def qwen35_oq_a8_quantize(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A: BF16/FP16 activations -> (Qa int8, Sa float32, Ra int16).
+
+    Run this once per shared activation and feed the result to every
+    projection that consumes it, whatever their bit widths.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_quantize"):
+        raise RuntimeError("qwen35_oq_a8_quantize native kernel is unavailable")
+    qa, sa, ra = _ext.qwen35_oq_a8_quantize(
+        x,
+        act_mode,
+        **_native_stream_kwargs(stream),
+    )
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_qmm_t(
+    qa: mx.array,
+    sa: mx.array,
+    ra: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
+        raise RuntimeError("qwen35_oq_a8_qmm_t native kernel is unavailable")
+    return _ext.qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        bits,
+        act_mode,
+        variant,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen35_oq_a8_linear(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    stream=None,
+) -> mx.array:
+    """Convenience Stage-A + GEMM for a projection with no shared activation."""
+    qa, sa, ra = qwen35_oq_a8_stage_a_v8(x, act_mode, stream=stream)
+    return qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        mx.contiguous(scales.T),
+        mx.contiguous(biases.T),
+        bits,
+        act_mode,
+        variant,
+        stream=stream,
+    )
+
+
+def qwen35_oq_a8_stage_a_v8(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Reorder activations for the native GEMM and transpose group metadata.
+
+    Within each GS64 group, slot ``16c + 4t + j`` holds
+    ``k = 16c + 8*(t>>1) + 2j + (t&1)``. This permutation preserves the
+    group sum and requires a temporary contiguous INT8 activation copy.
+    """
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    shape = qa.shape
+    k = shape[-1]
+    m = qa.size // k
+    # Reshaped back to the input's own rank, not to [M, K]: the op derives the
+    # output shape from Qa, so flattening a [B, S, K] activation here would
+    # hand the caller a [B*S, N] result. With B == 1 that broadcasts against
+    # the residual and hides; with B > 1 it is silently wrong.
+    qa = mx.contiguous(
+        qa.reshape(m, k // 64, 4, 2, 4, 2).transpose(0, 1, 2, 3, 5, 4).reshape(shape)
+    )
+    # Flattened to [M, groups] before transposing, not transposed in place:
+    # mx.transpose reverses *every* axis, so a [B, S, groups] Ra would come
+    # back as [groups, S, B] -- which is the layout the kernel wants only when
+    # B == 1, and silently interleaves the sequences when it is not.
+    ra = mx.contiguous(ra.reshape(m, -1).T)
+    if act_mode != 0:
+        sa = mx.contiguous(sa.reshape(m, -1).T)
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_decode_weights(
+    weight: mx.array,
+    bits: int,
+    group_count: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Unpack Q4/Q5 codes to INT8.
+
+    Test helper only: the production path never materializes unpacked weights
+    in device memory.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_decode_weights"):
+        raise RuntimeError(
+            "qwen35_oq_a8_decode_weights native kernel is unavailable"
+        )
+    return _ext.qwen35_oq_a8_decode_weights(
+        weight,
+        bits,
+        group_count,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def __getattr__(name: str) -> Any:

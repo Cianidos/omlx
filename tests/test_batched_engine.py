@@ -902,6 +902,21 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert call_kwargs["specprefill_threshold"] == 100
 
     @pytest.mark.asyncio
+    async def test_generate_forwards_preserve_reasoning(self):
+        """The non-streaming path must carry the flag the streaming path already does."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", preserve_reasoning=True)
+
+        assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
+
+    @pytest.mark.asyncio
     async def test_generate_forwards_tools(self):
         from omlx.engine.batched import BatchedEngine
 
@@ -988,3 +1003,42 @@ class TestBatchedEngineSpecPrefillForwarding:
 
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "specprefill_system_end" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_chat_injects_generation_prompt_text(self):
+        """The suffix past the no-generation-prompt rendering reaches the engine."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        def fake_template(msgs, *args, **kwargs):
+            # History renders the reply behind an empty think block, so the
+            # generation prompt does not persist into the next turn.
+            if any(m["role"] == "assistant" for m in msgs):
+                return "PROMPT<|im_start|>assistant\nreply<|im_end|>"
+            if kwargs.get("add_generation_prompt") is False:
+                return "PROMPT"
+            return "PROMPT<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        engine._apply_chat_template = fake_template
+        messages = [{"role": "user", "content": "hi"}]
+
+        await engine.chat(messages)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert (
+            call_kwargs["generation_prompt_text"]
+            == "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        assert call_kwargs["generation_prompt_persists"] is False
+
+        # A continued (partial) final message has no generation prompt.
+        await engine.chat(messages, is_partial=True)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert "generation_prompt_text" not in call_kwargs

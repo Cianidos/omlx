@@ -6,12 +6,10 @@ but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
 That default materializes the full ``[n_q, query_len, kv_len]`` score matrix and
 can still exceed oMLX's memory-guard ceiling.
 
-When the unfused transient fits, this patch preserves MLX's default routing. If
-it does not fit (or no guard ceiling is available), it calls MLX 0.32.2 with
-``force_fused=True``. This replaces oMLX's old pure-array tiled implementation:
-the bounded route is now an upstream native fused kernel instead of the slow
-sequential tile loop. On NAX, MLX's default already selects its fast split-D
-head-dim-256 kernel for causal prefills with at least 1024 queries.
+When the unfused transient fits, this patch preserves MLX's default routing.
+Otherwise, it uses ``force_fused=True`` for FP16/BF16 inputs and array tiling for FP32.
+The native FP32 full-attention kernel exceeds 32 KiB of threadgroup memory.
+On NAX, MLX's default selects its fast split-D head-dim-256 kernel for causal prefills with at least 1024 queries.
 
 ``OMLX_SDPA256_TILED=1/0`` remains accepted for compatibility and now forces or
 disables the bounded route. Metal uses the native fused kernel; CUDA retains
@@ -25,11 +23,15 @@ everything else passes through to the original SDPA unchanged.
 
 import logging
 import os
+import threading
 import weakref
 
 import mlx.core as mx
 
-from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+from omlx.memory_monitor import (
+    SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+    estimate_unfused_sdpa_call_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +53,12 @@ _KV_TILE = 1024
 _NEG_INF = -1e30
 
 # Live guard-headroom provider for memory-aware routing (issue #2204).
-# Registered by Scheduler.__init__ as a bound method returning the bytes left
-# under the adaptive-prefill-throttle target (hard ceiling x headroom safety,
-# clamped by the abort cap), or a negative value when no ceiling is active.
-# Held as a WeakMethod so a torn-down Scheduler auto-unregisters and the route
-# falls back to the memory-bounded native fused default.
-_HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
+# Scheduler.step registers the active Scheduler on its execution thread. Each
+# engine uses its own worker, so thread-local storage keeps concurrent engines
+# from replacing one another's provider. The bound method is weakly held so a
+# torn-down Scheduler leaves that worker on the memory-bounded native fused
+# default.
+_HEADROOM_PROVIDER_LOCAL = threading.local()
 # Backward-compatible override: True = always force fused, False = never force,
 # None = memory-aware auto.
 _FORCE_TILED: bool | None = None
@@ -79,11 +81,21 @@ def _note_tiled_route(reason: str, detail: str) -> None:
 
 
 def set_unfused_headroom_provider(method) -> None:
-    """Register a bound method returning the prefill guard's live headroom in
-    bytes (negative when no ceiling is active). Lets ``_should_route`` prefer
-    the faster unfused fallback whenever its O(L^2) transient fits."""
-    global _HEADROOM_PROVIDER
-    _HEADROOM_PROVIDER = weakref.WeakMethod(method)
+    """Bind the active Scheduler's headroom provider to this worker thread."""
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    current = ref() if ref is not None else None
+    if (
+        current is not None
+        and current.__self__ is method.__self__
+        and current.__func__ is method.__func__
+    ):
+        return
+    _HEADROOM_PROVIDER_LOCAL.ref = weakref.WeakMethod(method)
+
+
+def _get_unfused_headroom_provider():
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    return ref() if ref is not None else None
 
 
 def _parse_force_tiled_env() -> bool | None:
@@ -95,6 +107,17 @@ def _parse_force_tiled_env() -> bool | None:
     return None
 
 
+def _notify_bounded_route(provider, active: bool) -> None:
+    """Let the scheduler retire measurements from the previous route."""
+    try:
+        owner = getattr(provider, "__self__", None)
+        callback = getattr(owner, "_sdpa256_bounded_route_changed", None)
+        if callable(callback):
+            callback(active)
+    except Exception:
+        logger.debug("sdpa256 route notification failed", exc_info=True)
+
+
 def _tiled_route_required(queries, keys) -> bool:
     """Decide forced-fused vs default for a matched call (True = force).
 
@@ -102,12 +125,13 @@ def _tiled_route_required(queries, keys) -> bool:
     (issues #2155 / #2204), so force the fused path only when the unfused
     transient would not fit under the guard ceiling — or when no headroom
     info is available, keeping the memory-safe #2025 behavior."""
+    provider = _get_unfused_headroom_provider()
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
+        _notify_bounded_route(provider, _FORCE_TILED)
         return _FORCE_TILED
     try:
-        provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
         if provider is None:
             _note_tiled_route(
                 "no-provider",
@@ -122,6 +146,7 @@ def _tiled_route_required(queries, keys) -> bool:
                 "memory ceiling not available (enforcer state not yet "
                 "propagated)",
             )
+            _notify_bounded_route(provider, True)
             return True
         batch, n_q, q_len, _ = queries.shape
         transient = estimate_unfused_sdpa_call_bytes(
@@ -129,17 +154,22 @@ def _tiled_route_required(queries, keys) -> bool:
             q_len,
             keys.shape[-2],
             HEAD_DIM,
-            score_dtype_size=queries.dtype.size,
+            # The unfused fallback materializes fp32 scores even for bf16
+            # inputs (issue #2204 follow-up): pricing it at the query dtype
+            # halves the predicted matrix and admits OOM spikes at long
+            # context. Shared with the guard via the memory_monitor constant.
+            score_dtype_size=SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
         )
-        if transient > headroom:
+        bounded = transient > headroom
+        _notify_bounded_route(provider, bounded)
+        if bounded:
             _note_tiled_route(
                 "insufficient-headroom",
                 f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
                 f"guard headroom ~{headroom / 2**20:.0f}MiB at "
                 f"kv_len={keys.shape[-2]}",
             )
-            return True
-        return False
+        return bounded
     except Exception:
         _note_tiled_route("probe-error", "guard headroom probe failed")
         logger.debug("sdpa256 headroom probe failed", exc_info=True)
@@ -166,6 +196,7 @@ def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
 
 def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
     """Portable bounded fallback for shapes without a native fused kernel."""
+    output_dtype = mx.result_type(queries.dtype, keys.dtype, values.dtype)
     batch, n_q, q_len, head_dim = queries.shape
     _, n_kv, k_len, _ = keys.shape
     value_dim = values.shape[-1]
@@ -224,7 +255,7 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
             m = new_max
             mx.eval(m, denom, acc)
 
-        out_tile = (acc / denom).astype(queries.dtype)
+        out_tile = (acc / denom).astype(output_dtype)
         mx.eval(out_tile)
         out_q_tiles.append(out_tile)
 
@@ -232,23 +263,60 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
     return out.reshape(batch, n_q, q_len, value_dim)
 
 
+# ``force_fused=`` arrived in MLX 0.32.2. On an older runtime the keyword is a
+# TypeError, and retrying without it is not a safe substitute -- MLX would then
+# be free to pick the unfused fp32 score matrix, which is the O(L^2) spike this
+# patch exists to bound. Such a runtime routes to the array-tiled path instead,
+# which is bounded by construction.
+#
+# Probed by use rather than by signature: MLX's nanobind functions report
+# ``(*args, **kwargs)``, so the keyword is only visible in the docstring, and
+# ``python -OO`` strips that. One TypeError on the first call is cheaper than a
+# fragile capability check, and the answer is latched.
+_NATIVE_FORCE_FUSED = True
+
+
 def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
-    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere."""
+    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere.
+
+    Explicit array masks never take the native fused call: MLX's fused
+    array-mask support is unproven and may silently fall back to the
+    unfused fp32 score matrix, which is exactly the O(L^2) spike this patch
+    exists to bound. The array-tiled implementation already handles bool and
+    additive masks, so route them there directly."""
+    global _NATIVE_FORCE_FUSED
+
+    if isinstance(mask, mx.array):
+        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
+    # MLX promotes Q/K/V together; any FP32 input selects the 53,760-byte kernel.
+    if mx.result_type(queries.dtype, keys.dtype, values.dtype) == mx.float32:
+        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
         isinstance(mask, str)
         and mask == "causal"
         and queries.shape[-2] > keys.shape[-2]
     )
-    if mx.metal.is_available() and native_shape:
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            sinks=sinks,
-            force_fused=True,
-        )
+    if mx.metal.is_available() and native_shape and _NATIVE_FORCE_FUSED:
+        try:
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
+                sinks=sinks,
+                force_fused=True,
+            )
+        except TypeError:
+            # Falling through to the tiled path rather than re-raising: it is a
+            # correct implementation of the same op, so a genuinely malformed
+            # call still fails there rather than being swallowed here.
+            _NATIVE_FORCE_FUSED = False
+            logger.warning(
+                "sdpa256: mlx %s has no force_fused= (0.32.2+); using the "
+                "array-tiled bounded route instead of the native fused kernel",
+                getattr(mx, "__version__", "?"),
+            )
     return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
@@ -297,6 +365,7 @@ def _register_bounded_route(min_kv_len: int) -> bool:
             min_query_len=_SDPA256_MIN_Q_LEN,
             min_kv_len=min_kv_len,
             kv_tile=_KV_TILE,
+            supports_array_mask=True,
         )
     except Exception:
         logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)
