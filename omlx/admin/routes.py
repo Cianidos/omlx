@@ -50,6 +50,7 @@ from ..model_settings import (
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
     validate_moe_expert_offload,
+    MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
     validate_kv_compression_settings,
 )
@@ -1357,6 +1358,10 @@ async def _apply_cache_settings_runtime(
         global_settings.cache.initial_cache_blocks
     )
 
+    pool._scheduler_config.paged_ssd_cache_auto_size = (
+        ssd_cache_max_size or global_settings.cache.ssd_cache_max_size
+    ).lower() == "auto"
+
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
         pool._scheduler_config.paged_ssd_cache_dir = None
@@ -2491,6 +2496,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
+            "moe_offload_allows_mtp": (
+                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+                in MOE_OFFLOAD_MTP_MODEL_TYPES
+            ),
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
@@ -3568,7 +3577,9 @@ def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
     try:
-        validate_moe_expert_offload(settings)
+        validate_moe_expert_offload(
+            settings, model_type=getattr(entry, "config_model_type", None)
+        )
         if settings.get("moe_expert_offload_enabled"):
             from ..patches.moe_offload_compat import moe_offload_compatibility
 
@@ -3956,7 +3967,7 @@ def _feature_problem(
         return None
     if name == "moe_expert_offload":
         try:
-            validate_moe_expert_offload(snapshot)
+            validate_moe_expert_offload(snapshot, model_type=entry.config_model_type)
         except ValueError as error:
             return str(error)
         supported, reason = moe_offload_compatibility(entry.model_path)
@@ -4548,6 +4559,8 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
 
 
 def _global_settings_response(global_settings):
+    from ..settings import get_auto_ssd_cache_size
+
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -4617,12 +4630,8 @@ def _global_settings_response(global_settings):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
-            # Resolve "auto" to actual value (10% of SSD capacity)
-            "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(
-                    global_settings.base_path
-                )
-            ),
+            "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
+            "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
@@ -5131,6 +5140,9 @@ async def update_global_settings(
     requested_storage = request.gdn_snapshot_storage
     if requested_storage is not None:
         requested_storage = requested_storage.strip().lower()
+        requested_storage = {"ssd": "ssd_sidecar", "hot": "embedded"}.get(
+            requested_storage, requested_storage
+        )
         if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
             raise HTTPException(
                 status_code=400,
@@ -5208,46 +5220,80 @@ async def update_global_settings(
             ),
         )
     # Apply cache settings
+    # The dashboard sends all cache fields. Unchanged values must not unload engines.
     cache_changed = False
     if request.cache_enabled is not None:
-        global_settings.cache.enabled = request.cache_enabled
-        cache_changed = True
+        if request.cache_enabled != global_settings.cache.enabled:
+            global_settings.cache.enabled = request.cache_enabled
+            cache_changed = True
     if request.ssd_cache_dir is not None:
-        global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
-        cache_changed = True
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
+            else (global_settings.base_path / "cache").resolve()
+        )
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
+            global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
+            cache_changed = True
     if request.ssd_cache_max_size is not None:
-        global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
-        cache_changed = True
+        if request.ssd_cache_max_size != global_settings.cache.ssd_cache_max_size:
+            global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
+            cache_changed = True
     if request.hot_cache_only is not None:
-        global_settings.cache.hot_cache_only = request.hot_cache_only
-        cache_changed = True
+        if request.hot_cache_only != global_settings.cache.hot_cache_only:
+            global_settings.cache.hot_cache_only = request.hot_cache_only
+            cache_changed = True
     if request.hot_cache_write_through is not None:
-        global_settings.cache.hot_cache_write_through = (
+        if (
             request.hot_cache_write_through
-        )
-        cache_changed = True
+            != global_settings.cache.hot_cache_write_through
+        ):
+            global_settings.cache.hot_cache_write_through = (
+                request.hot_cache_write_through
+            )
+            cache_changed = True
     if requested_storage is not None:
-        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
-        cache_changed = True
+        if requested_storage != global_settings.cache.get_gdn_snapshot_storage():
+            global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+            cache_changed = True
     elif request.gdn_ssd_split_enabled is not None:
-        global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
-        cache_changed = True
+        if (
+            request.gdn_ssd_split_enabled
+            != global_settings.cache.gdn_ssd_split_enabled
+        ):
+            global_settings.cache.gdn_ssd_split_enabled = (
+                request.gdn_ssd_split_enabled
+            )
+            cache_changed = True
     if request.gdn_ssd_pending_max_size is not None:
-        global_settings.cache.gdn_ssd_pending_max_size = (
+        if (
             request.gdn_ssd_pending_max_size
-        )
-        cache_changed = True
+            != global_settings.cache.gdn_ssd_pending_max_size
+        ):
+            global_settings.cache.gdn_ssd_pending_max_size = (
+                request.gdn_ssd_pending_max_size
+            )
+            cache_changed = True
     if request.gdn_sidecar_precision is not None:
-        global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_precision.lower()
-        )
-        cache_changed = True
+        new_sidecar_dtype = request.gdn_sidecar_precision.lower()
+        if new_sidecar_dtype != global_settings.cache.gdn_sidecar_state_dtype:
+            global_settings.cache.gdn_sidecar_state_dtype = new_sidecar_dtype
+            cache_changed = True
     if request.hot_cache_max_size is not None:
-        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
-        cache_changed = True
+        if request.hot_cache_max_size != global_settings.cache.hot_cache_max_size:
+            global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
+            cache_changed = True
     if request.initial_cache_blocks is not None:
-        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
-        cache_changed = True
+        if (
+            request.initial_cache_blocks
+            != global_settings.cache.initial_cache_blocks
+        ):
+            global_settings.cache.initial_cache_blocks = (
+                request.initial_cache_blocks
+            )
+            cache_changed = True
     # No cache_changed: reloading models cannot re-arm the native gate, which
     # reads the env var once at the first ANE compile of the process. The env
     # update covers a process that has not compiled yet; otherwise restart.
@@ -6055,8 +6101,14 @@ def _build_runtime_cache_observability(
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     cache_cfg = global_settings.cache
+    engine_pool = _get_engine_pool()
+    auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
     try:
-        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        cfg_disk_max = (
+            0
+            if auto_size and engine_pool is not None
+            else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        )
     except (ValueError, OSError, TypeError) as exc:
         logger.warning("Could not read SSD cache max size from config: %s", exc)
         cfg_disk_max = 0
@@ -6075,7 +6127,6 @@ def _build_runtime_cache_observability(
         "hot_cache_entries": 0,
     }
 
-    engine_pool = _get_engine_pool()
     if engine_pool is None:
         return payload
 
@@ -6330,6 +6381,11 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
+    if auto_size and not payload["models"] and engine_pool is not None:
+        try:
+            disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        except (ValueError, OSError, TypeError) as exc:
+            logger.warning("Could not read automatic SSD cache limit: %s", exc)
     payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache

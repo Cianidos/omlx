@@ -250,6 +250,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     return quant_method == "fp8" and (
         _is_deepseek_v4_config(config)
         or config.get("model_type") == "bailing_hybrid"
+        or (
+            config.get("model_type") == "mimo_v2"
+            and quantization_config.get("store_dtype") == "mxfp4"
+        )
     )
 
 
@@ -1830,6 +1834,38 @@ def _shard_key_map(model_dir: Path) -> dict:
     return key_map
 
 
+# Qwen3-Next RMSNorm gammas inside the MTP head. Raw-HF stores them
+# zero-centered; the MLX runtime expects the +1 form.
+_QWEN_MTP_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+    ".pre_fc_norm_hidden.weight",
+    ".pre_fc_norm_embedding.weight",
+    "mtp.norm.weight",
+)
+
+
+def _checkpoint_has_unsanitized_conv1d(model_dir: Path, key_map: dict) -> bool:
+    """True when a backbone conv1d tensor still has the raw-HF layout.
+
+    Reads only the safetensors header of one shard. Mirrors the raw-HF
+    discriminator the Qwen3.5 sanitizers use, so a donor head gets the
+    same norm treatment it would get when loaded directly.
+    """
+    conv_key = next(
+        (k for k in key_map if "conv1d.weight" in k and "mtp." not in k), None
+    )
+    if conv_key is None:
+        return False
+    with open(model_dir / key_map[conv_key], "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    shape = header.get(conv_key, {}).get("shape") or ()
+    return bool(shape) and shape[-1] != 1
+
+
 def _strip_mtp_key_prefix(key: str) -> Optional[str]:
     """Normalize an mtp tensor key to its bare ``mtp.<rest>`` form."""
     from omlx.utils.model_loading import _MTP_WEIGHT_PREFIXES
@@ -1917,10 +1953,9 @@ def combine_mtp_donor(
     dtype: bf16 heads stay bf16 and pre-quantized heads pass through
     packed, with explicit per-layer entries synthesized into the output's
     quantization config (the donor's global bits may differ from the
-    recipient's). The norm +1 convention is left untouched on purpose —
-    the qwen sanitize decides the shift per-key by tensor mean and
-    norm_repair anchors the outliers, so raw-HF and MLX-convention donors
-    both load correctly.
+    recipient's). Head RMSNorm gammas follow the same rule as model
+    loading: a raw-HF donor (unsanitized conv1d layout) gets +1 on every
+    zero-centered gamma, an MLX-format donor is copied as stored.
     """
     output = Path(output_path)
     donor = Path(donor_path)
@@ -1950,13 +1985,21 @@ def combine_mtp_donor(
 
     # Load only the donor shards that contain mtp keys, one shard at a
     # time, dropping non-mtp tensors immediately (peak memory = 1 shard).
+    donor_is_raw_hf = _checkpoint_has_unsanitized_conv1d(donor, donor_key_map)
     mtp_weights: dict = {}
     for shard in sorted(set(mtp_key_shards.values())):
         shard_weights = mx.load(str(donor / shard))
         for key, value in shard_weights.items():
             bare = _strip_mtp_key_prefix(key)
-            if bare is not None:
-                mtp_weights[recipient_prefix + bare] = value
+            if bare is None:
+                continue
+            if (
+                donor_is_raw_hf
+                and value.ndim == 1
+                and bare.endswith(_QWEN_MTP_NORM_SUFFIXES)
+            ):
+                value = value + 1.0
+            mtp_weights[recipient_prefix + bare] = value
         del shard_weights
 
     mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
@@ -2740,7 +2783,6 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "stack",
         "concatenate",
         "add",
-        "add_if_mean_lt_0_5",
         "transpose_",
         "moveaxis_",
         "split_",
@@ -3110,13 +3152,6 @@ class _DiscoveredPlan:
         if transform == "add":
             arr = self._materialize_source(sources[0])
             return arr + 1.0  # norm weight += 1.0 pattern
-
-        if transform == "add_if_mean_lt_0_5":
-            arr = self._materialize_source(sources[0])
-            mean = float(mx.mean(arr.astype(mx.float32)).item())
-            if mean < 0.5:
-                return arr + 1.0
-            return arr
 
         if transform == "reshape":
             arr = self._materialize_source(sources[0])
@@ -4611,6 +4646,11 @@ class _LazyTensorIndex:
         config: dict | None = None,
     ):
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
+        self._mimo_mxfp4 = bool(
+            config
+            and config.get("model_type") == "mimo_v2"
+            and (config.get("quantization_config") or {}).get("store_dtype") == "mxfp4"
+        )
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -4743,7 +4783,10 @@ class _LazyTensorIndex:
                 if (
                     wk in self._index
                     and wk not in seen
-                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                    and (
+                        self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                        or (self._mimo_mxfp4 and self._index[wk][5] == "U8")
+                    )
                 ):
                     self._fp8_pairs[wk] = k
                     seen.add(wk)
@@ -4770,6 +4813,10 @@ class _LazyTensorIndex:
         if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
+        if self._mimo_mxfp4 and sk.endswith(".weight_scale") and w_dtype == "U8":
+            if s_dtype != "U8" or cols % 16 or tuple(s_shape) != (rows, cols // 16):
+                raise ValueError(f"Invalid MiMo MXFP4 weight/scale pair: {wk}")
+            return {"kind": "mxfp4", "bits": 4, "group_size": 32, "mode": "mxfp4"}
         # MiniMax MXFP8 checkpoints store E8M0 exponent bytes under the
         # ``weight_scale_inv`` suffix even though the model sanitizer passes
         # them directly to MLX as ``.scales``. Enable this only from an
@@ -5955,6 +6002,11 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    mimo_multimodal = (
+        normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
+        and _has_vision_subconfig(config)
+        and not text_only
+    )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -5982,6 +6034,7 @@ def quantize_oq_streaming(
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
         and _has_vision_subconfig(config)
         and not text_only
+        and not mimo_multimodal
     ):
         logger.warning(
             "oQ only supports the %s text backbone; enabling text-only output",
@@ -6796,6 +6849,11 @@ def quantize_oq_streaming(
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
+
+    if mimo_multimodal:
+        from .patches.mimo_v2.omnimodal import export_sidecars
+
+        export_sidecars(source, output, config)
 
     cb("saving", 100.0, "Quantized model saved")
     logger.info(

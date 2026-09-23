@@ -8,6 +8,9 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -1048,8 +1051,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
@@ -1901,6 +1902,9 @@
                         ? 4 : (s.turboquant_kv_bits || 4),
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -1959,6 +1963,40 @@
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
                 };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {
@@ -5899,7 +5937,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
