@@ -369,6 +369,16 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
+    """Keep official MiMo MXFP4 experts packed during model loading."""
+    if cfg.get("model_type") != "mimo_v2" or isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config") or {}
+    if qc.get("store_dtype") == "mxfp4":
+        cfg["quantization"] = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -389,6 +399,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_mimo_mxfp4_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
