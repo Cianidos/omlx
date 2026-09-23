@@ -189,7 +189,7 @@ def test_every_bundled_nax_qmm_tile_matches_stock(
     ref = mx.quantized_matmul(
         x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
     )
-    monkeypatch.setattr(fast, "QMM_NAX_VARIANT", variant)
+    monkeypatch.setenv("OMLX_QWEN35_QMM_NAX_VARIANT", str(variant))
     native = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")
     out = native(x, wq, scales, biases, 8, group_size)
     ref32 = ref.astype(mx.float32)
