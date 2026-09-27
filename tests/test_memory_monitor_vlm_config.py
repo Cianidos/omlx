@@ -483,8 +483,8 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         expected = 4.0 / 8.0 + 2.0 / 128
         assert abs(kwargs["dtype_size"] - expected) < 1e-9
-        # Prefill holds fp16 KV until conversion, then both copies.
-        assert abs(kwargs["prefill_dtype_size"] - (2.0 + expected)) < 1e-9
+        # Cold prefill holds fp16 KV until conversion.
+        assert kwargs["prefill_dtype_size"] == 2.0
 
     def test_turboquant_prefill_kv_is_priced_at_full_width(self):
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
@@ -494,12 +494,10 @@ class TestSetModelInfoTurboQuantDtype:
             num_kv_heads=8,
             head_dim=128,
             dtype_size=quantized,
-            prefill_dtype_size=2.0 + quantized,
+            prefill_dtype_size=2.0,
         )
         per_token_fp16 = 40 * 8 * 128 * 2 * 2
-        assert monitor.estimate_prompt_kv_bytes(1000) == pytest.approx(
-            1000 * per_token_fp16 * (2.0 + quantized) / 2.0
-        )
+        assert monitor.estimate_prompt_kv_bytes(1000) == per_token_fp16 * 1000
 
     def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
         sched = self._make_sched_with_config(_PlainLMConfig())

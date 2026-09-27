@@ -130,7 +130,7 @@ async def test_sampling_setting_change_keeps_cached_failure():
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_kv_format_change_reloads_only_when_compression_is_enabled(enabled):
     pool, entry = _failed_pool()
-    entry.engine = MagicMock()
+    entry.engine = _idle_engine()
     entry.load_failed = False
     pool._unload_engine = AsyncMock()
 
@@ -142,6 +142,8 @@ async def test_kv_format_change_reloads_only_when_compression_is_enabled(enabled
 
     assert result["settings"]["turboquant_kv_scheme"] == "affine4"
     assert result["requires_reload"] is enabled
+    assert result["auto_unloaded"] is enabled
+    assert result["reload_deferred"] is False
     assert pool._unload_engine.await_count == int(enabled)
 
 

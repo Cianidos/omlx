@@ -14152,16 +14152,10 @@ class Scheduler:
                     head_dim=head_dim,
                     dtype_size=dtype_size,
                     # TurboQuant converts the prompt's KV only after prefill,
-                    # so prefill holds full-width KV and then both copies.
-                    # Affine caches remain packed throughout prefill.
+                    # so prefill holds full-width KV. Affine caches remain
+                    # packed throughout prefill.
                     prefill_dtype_size=(
-                        prefill_kv_dtype_size
-                        if affine_prefill
-                        else (
-                            base_dtype_size + dtype_size
-                            if dtype_size != base_dtype_size
-                            else None
-                        )
+                        prefill_kv_dtype_size if affine_prefill else base_dtype_size
                     ),
                     affine_prefill=affine_prefill,
                     num_attention_heads=num_attention_heads,
