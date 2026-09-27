@@ -37,6 +37,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .. import glm53_kda_prework
 from ..mlx_lm_mtp import prompt_priming
 from .glm5_next_batch_rollback import rollback_rows
 
@@ -239,6 +240,12 @@ def _patch_linear_attention(g5_lang: Any) -> None:
 
     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
         B, S, _ = inputs.shape
+        # Same fused KDA prefill route as the vendor body's gate. The verify
+        # capture path needs the stock locals, so it never takes the shortcut.
+        if gdn_sink is None and glm53_kda_prework.glm53_kda_prefill_eligible(
+            self, inputs, mask, cache
+        ):
+            return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]
@@ -455,7 +462,7 @@ def _patch_language_model(g5_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         original_init(self, args, config)
         self._omlx_mtp_multi_request = True
@@ -477,6 +484,7 @@ def _patch_language_model(g5_lang: Any) -> None:
             # a full rejection cannot be undone. Cap the chain one below it.
             requested_depth = get_mtp_depth()
             self._omlx_mtp_depth = min(_MAX_CHAIN_DEPTH, requested_depth)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             if requested_depth > _MAX_CHAIN_DEPTH:
                 logger.info(
                     "glm5_next MTP chain depth capped at %d (requested %d): the "
