@@ -745,7 +745,7 @@ def _attention_warps(dim: int) -> int:
     if dim <= 64:
         return 1
     if dim == 96:
-        return 2
+        return 3
     return 4
 
 

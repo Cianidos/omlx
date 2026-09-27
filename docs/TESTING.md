@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
@@ -9,6 +15,13 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 # Test timing
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+
+The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
+limits and real-model benchmark requirements.
 
 # First-token burst release
 
@@ -52,6 +65,8 @@ Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA
 The integration tests cover restored-prefix lengths with boundary snapshots enabled and disabled, the first allocation after cache restoration, and prefill/decode output equivalence using a small Qwen4 model.
 
 Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4_qsa_decode_gather.py`, and `test_prefill_oom_graceful.py`.
+
+For Qwen4 native sparse-GQA prefill measurements, run `python benchmarks/bench_qwen4_qsa_sparse_gqa.py --key-tokens 24576 --query-tokens 1024 --repetitions 30`. The benchmark reports index scoring, top-k selection, the combined native pipeline, every supported main-attention tile, the portable reference, and maximum error. Production groups native query rows into 4,096-row tiles through 32K keys, 2,048-row tiles through 64K, and 1,024-row tiles above 64K; this bounds the FP32 score sheet while amortizing per-tile dispatch.
 
 # Prefill memory accounting tests
 
@@ -107,7 +122,8 @@ save/reopen payload and speculative-decoding toggle exclusion.
 
 `tests/test_moe_expert_offload.py` also exercises Qwen4-Exp MoE routing with
 512 experts, top-k 10, 64 resident slots, shared experts, and repeated
-evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
+evictions, plus the resident Lightning MTP head (`mtp.*`) and its admission
+pricing. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
 
@@ -128,6 +144,10 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 ### Lightning MTP with XTC sampling
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
+
+### Batched DFlash drafter
+
+Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
 
 # VLM cache boundary tests
 
@@ -151,3 +171,7 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Fused routed-expert decode tests
+
+Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances with random 4-bit weights at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10) and at hidden 1024 / intermediate 320 must match the composed body bit for bit. The other cases check that shapes where MLX would pick a different mat-vec partition, other bit widths and group sizes, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the composed body.
