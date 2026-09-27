@@ -2,6 +2,7 @@
 """Affine4 routing through model attention, batching, and scheduler admission."""
 
 import importlib
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -83,19 +84,38 @@ def test_affine4_allows_sink_aware_fallback(scheduler):
 
 @pytest.mark.parametrize("module", ["mlx_lm.models.base", "mlx_vlm.models.base"])
 def test_attention_dispatch_bypasses_turboquant_codebook_kernels(module):
-    apply_turboquant_attention_patch()
-    dispatch = importlib.import_module(module).scaled_dot_product_attention
-    cache = Affine4KVCache()
-    q = mx.ones((1, 4, 3, 64))
-    keys, values = cache.update_and_fetch(
-        mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64))
-    )
-    sinks = mx.zeros((4,))
-    with patch.object(cache, "attention", return_value=q) as attention:
-        assert dispatch(q, keys, values, cache, 0.125, "causal", sinks) is q
-    attention.assert_called_once_with(
-        q, keys_state=keys, values_state=values, scale=0.125, mask="causal", sinks=sinks
-    )
+    snapshots = {
+        mod: mod.scaled_dot_product_attention
+        for name, mod in tuple(sys.modules.items())
+        if mod is not None
+        and name.startswith(("mlx_lm.models.", "mlx_vlm.models."))
+        and hasattr(mod, "scaled_dot_product_attention")
+    }
+    try:
+        apply_turboquant_attention_patch()
+        dispatch = importlib.import_module(module).scaled_dot_product_attention
+        cache = Affine4KVCache()
+        q = mx.ones((1, 4, 3, 64))
+        keys, values = cache.update_and_fetch(
+            mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64))
+        )
+        sinks = mx.zeros((4,))
+        with patch.object(cache, "attention", return_value=q) as attention:
+            assert dispatch(q, keys, values, cache, 0.125, "causal", sinks) is q
+        attention.assert_called_once_with(
+            q,
+            keys_state=keys,
+            values_state=values,
+            scale=0.125,
+            mask="causal",
+            sinks=sinks,
+        )
+    finally:
+        for mod, function in snapshots.items():
+            mod.scaled_dot_product_attention = function
+        import omlx.patches.turboquant_attention as turboquant_attention
+
+        turboquant_attention._PATCHED = False
 
 
 def test_batch_rejects_same_width_different_codecs():

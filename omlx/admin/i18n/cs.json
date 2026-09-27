@@ -1208,6 +1208,7 @@
   "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "Externí drafter (asistent Gemma 4 nebo Qwen MTP) zrychluje jednotlivé požadavky.",
   "modal.model_settings.vlm_mtp_conflict": "Nejprve vypněte DFlash / SpecPrefill / MTP / TurboQuant KV - cestu spekulativního dekódování vlastní VLM MTP.",
+  "modal.model_settings.vlm_mtp_compression_conflict": "Nejprve vypněte DFlash / SpecPrefill / MTP / kompresi KV cache - cestu spekulativního dekódování vlastní VLM MTP.",
   "modal.model_settings.vlm_mtp_processor_conflict": "Nejprve zrušte repetition penalty a presence penalty a řízenou gramatiku - VLM MTP nedokáže aplikovat své procesory logitů na takové požadavky. Rozpočet přemýšlení podporován je.",
   "modal.model_settings.vlm_mtp_processor_locked": "Zamčeno při povoleném VLM MTP - toto nastavení potřebuje procesory logitů na úrovni požadavku, které VLM MTP nedokáže aplikovat.",
   "modal.model_settings.vlm_mtp_draft_model": "Drafter model",
