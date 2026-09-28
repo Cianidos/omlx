@@ -196,7 +196,7 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
     # whose closed-over fallback predates this fresh sdpa256 installation.
     mlx_base = importlib.import_module("mlx_lm.models.base")
     vlm_base = importlib.import_module("mlx_vlm.models.base")
-    qwen_module = sys.modules[type(attn).__module__]
+    qwen35_module = sys.modules[Qwen4ExpAttention.__mro__[1].__module__]
     sdpa_snap = {
         mod: mod.scaled_dot_product_attention
         for name, mod in tuple(sys.modules.items())
@@ -206,7 +206,7 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
     }
     mlx_base_snap = mlx_base.scaled_dot_product_attention
     vlm_base_snap = vlm_base.scaled_dot_product_attention
-    qwen_module.scaled_dot_product_attention = vlm_base.scaled_dot_product_attention
+    qwen35_module.scaled_dot_product_attention = vlm_base.scaled_dot_product_attention
     min_kv_len_snap = sdpa256._SDPA256_MIN_KV_LEN
     routes_snap = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.get(256)
     monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
